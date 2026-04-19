@@ -117,15 +117,27 @@ so FOCtave ships two extra tools to generate a visualisation video that
 plays in sync, with animated electrode glows showing exactly where
 current is flowing at any moment.
 
-### 1. Click electrode positions onto your still
+### 1. Place electrode positions onto your still (GUI)
 
 ```bash
-python place.py path/to/your_still.jpg
+python place.py                          # launch with no image loaded
+python place.py path/to/your_still.jpg   # open an image at launch
 ```
 
-A window opens with your image. Click four times in order (e1, e2, e3,
-e4). Right-click undoes the last click. Positions get saved to
-`your_still.electrodes.json`.
+A GUI opens with your image. Interactions:
+
+- **Left-click** empty space to place the next electrode (e1 -> e4 in order)
+- **Left-click + drag** a placed electrode to reposition it
+- **Right-click** an electrode to delete it
+- **File > Save** (or press `S`) writes `<image>.electrodes.json`
+- **File > Open** (or `O`) loads a different image; any existing
+  `.electrodes.json` for that image is auto-loaded so you can fine-tune
+  a previous placement
+- **File > Reset** (or `R`) clears all placed electrodes
+
+The status bar shows live image-space coordinates and placement count, and
+a faint dashed preview of the e1-e4 ribbon path is drawn between placed
+electrodes so you can see what the render will follow.
 
 ### 2. Render the video
 
