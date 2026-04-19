@@ -272,25 +272,31 @@ class StudioApp:
 
     def _build_top(self):
         top = tk.Frame(self.root, bg="#1e1e1e")
-        top.pack(side="top", fill="x")
+        top.pack(side="top", fill="x", padx=6, pady=6)
 
-        def add_row(label_text, var, browse_cb, row):
-            tk.Label(top, text=label_text, width=10, anchor="w",
-                     fg="#ddd", bg="#1e1e1e").grid(row=row, column=0, sticky="w", padx=8, pady=3)
-            entry = ttk.Entry(top, textvariable=var)
-            entry.grid(row=row, column=1, sticky="ew", padx=4, pady=3)
-            ttk.Button(top, text="Browse…", command=browse_cb).grid(row=row, column=2, padx=4, pady=3)
+        LABEL_WIDTH = 9      # uniform label column
+        ENTRY_WIDTH = 62     # characters; scrollable if path is longer
 
-        add_row("Project:", self.project_name, None, 0)
-        # Project column has no browse; replace it with a hint
-        tk.Label(top, text="(used for folder + file names)", fg="#777", bg="#1e1e1e").grid(
-            row=0, column=2, sticky="w", padx=4)
+        # Row 0 - Project (editable text)
+        tk.Label(top, text="Project:", width=LABEL_WIDTH, anchor="w",
+                 fg="#ddd", bg="#1e1e1e").grid(row=0, column=0, sticky="w", padx=(4, 6))
+        ttk.Entry(top, textvariable=self.project_name, width=ENTRY_WIDTH).grid(
+            row=0, column=1, sticky="w", pady=2)
+        tk.Label(top, text="(used for folder + file names)",
+                 fg="#777", bg="#1e1e1e").grid(row=0, column=2, sticky="w", padx=10)
 
-        add_row("Audio:", self.audio_path, self._browse_audio, 1)
-        add_row("Image:", self.image_path, self._browse_image, 2)
-        add_row("Output:", self.output_dir, self._browse_output, 3)
+        # Rows 1-3 - file pickers: read-only path display + Browse button
+        def file_row(row, label, var, cb):
+            tk.Label(top, text=label, width=LABEL_WIDTH, anchor="w",
+                     fg="#ddd", bg="#1e1e1e").grid(row=row, column=0, sticky="w", padx=(4, 6))
+            entry = ttk.Entry(top, textvariable=var, width=ENTRY_WIDTH, state="readonly")
+            entry.grid(row=row, column=1, sticky="w", pady=2)
+            ttk.Button(top, text="Browse…", command=cb, width=10).grid(
+                row=row, column=2, sticky="w", padx=(6, 4), pady=2)
 
-        top.grid_columnconfigure(1, weight=1)
+        file_row(1, "Audio:", self.audio_path, self._browse_audio)
+        file_row(2, "Image:", self.image_path, self._browse_image)
+        file_row(3, "Output:", self.output_dir, self._browse_output)
 
     def _build_main(self):
         main = tk.Frame(self.root)
