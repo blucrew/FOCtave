@@ -20,8 +20,12 @@ env/
 # Comparison / scratch dirs
 _compare/
 _scratch/
+_smoketest/
 scratch/
 out/
+
+# Electrode placements (user-specific, generated from click tool)
+*.electrodes.json
 
 # OS
 .DS_Store

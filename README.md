@@ -109,6 +109,65 @@ FOCtave writes the minimal funscript JSON used by restim's auto-detect:
 
 ---
 
+## Video pipeline (optional)
+
+restim drives its timeline from a media file playing in MPC-HC. You can
+point it at the source audio, but staring at a blank player is no fun -
+so FOCtave ships two extra tools to generate a visualisation video that
+plays in sync, with animated electrode glows showing exactly where
+current is flowing at any moment.
+
+### 1. Click electrode positions onto your still
+
+```bash
+python place.py path/to/your_still.jpg
+```
+
+A window opens with your image. Click four times in order (e1, e2, e3,
+e4). Right-click undoes the last click. Positions get saved to
+`your_still.electrodes.json`.
+
+### 2. Render the video
+
+```bash
+python render.py path/to/your_still.jpg
+```
+
+Picks up the funscripts and audio from the same directory automatically.
+Writes `your_still.mp4` alongside. Load that into MPC-HC instead of the
+raw audio and restim will time against it the same way.
+
+**What you get per frame:**
+
+- Base image, brightness breathing with the volume channel
+- Pre-blurred bloom layer that pulses along with volume (the image itself
+  glows when the action peaks)
+- Four radial glows at the clicked electrode positions - radius and
+  brightness driven by e1, e2, e3, e4 values
+- Arcs between every pair of electrodes, brightest when both endpoints
+  are lit (visualises FOC-Stim's any-to-any current routing)
+
+### Useful flags
+
+```bash
+# Preview the first 10 seconds
+python render.py image.jpg --duration 10
+
+# Higher resolution (slower)
+python render.py image.jpg --max-dim 1920
+
+# Less bloom / dimmer base
+python render.py image.jpg --bloom 0.25 --min-dim 0.75
+```
+
+### Performance
+
+MVP render speed is roughly real-time on 1280x720 (a 30-minute track
+takes ~30 minutes to render). Use `--duration` for quick previews while
+you iterate on electrode placement or tuning.
+
+---
+
 ## Requirements
 
 - Python 3.11+ (older may work; tested on 3.11)
