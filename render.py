@@ -112,34 +112,92 @@ def stamp_glow(canvas: np.ndarray, cx: int, cy: int, stamp: np.ndarray,
         canvas[dy0:dy1, dx0:dx1, c] += patch * color[c]
 
 
+def _safe_lerp(a: np.ndarray, b: np.ndarray, ta: float, tb: float, tv: float) -> np.ndarray:
+    if tb - ta < 1e-9:
+        return b
+    return ((tb - tv) / (tb - ta)) * a + ((tv - ta) / (tb - ta)) * b
+
+
+def catmull_rom_polyline(control_points: list, samples_per_segment: int = 60,
+                         alpha: float = 0.5) -> list[tuple[float, float]]:
+    """Return (x, y) points sampled along a centripetal Catmull-Rom spline
+    that passes exactly through each control point. With alpha=0.5 the curve
+    never overshoots. Accepts 2+ control points; with just 2 it degenerates
+    to a straight line."""
+    pts = [np.array(p, dtype=np.float64) for p in control_points]
+    n = len(pts)
+    if n < 2:
+        return [tuple(p) for p in pts]
+    # Phantom endpoints mirror the first/last segment so endpoint tangents
+    # behave smoothly instead of flying off.
+    ctrl = [pts[0] + (pts[0] - pts[1])] + pts + [pts[-1] + (pts[-1] - pts[-2])]
+    out: list[tuple[float, float]] = []
+    for seg in range(n - 1):
+        p0, p1, p2, p3 = (ctrl[seg + i] for i in range(4))
+        def knot(ti, a, b):
+            d = float(np.linalg.norm(b - a))
+            return ti + (d ** alpha if d > 0 else 1e-6)
+        t0 = 0.0
+        t1 = knot(t0, p0, p1)
+        t2 = knot(t1, p1, p2)
+        t3 = knot(t2, p2, p3)
+        for k in range(samples_per_segment):
+            frac = k / samples_per_segment
+            t = t1 + (t2 - t1) * frac
+            A1 = _safe_lerp(p0, p1, t0, t1, t)
+            A2 = _safe_lerp(p1, p2, t1, t2, t)
+            A3 = _safe_lerp(p2, p3, t2, t3, t)
+            B1 = _safe_lerp(A1, A2, t0, t2, t)
+            B2 = _safe_lerp(A2, A3, t1, t3, t)
+            C = _safe_lerp(B1, B2, t1, t2, t)
+            out.append((float(C[0]), float(C[1])))
+    out.append(tuple(pts[-1]))
+    return out
+
+
 def build_path(electrodes_ordered: list[tuple[int, int]],
                spacing_px: float = 2.0) -> tuple[np.ndarray, np.ndarray]:
-    """Sample the polyline e1 -> e2 -> e3 -> e4 at ~every `spacing_px` and
-    return (xy int array shape (N,2), barycentric weights shape (N,4)).
+    """Sample a centripetal Catmull-Rom spline through
+    e1 -> e2 -> e3 -> e4 at ~every `spacing_px` and return
+    (xy int array (N,2), barycentric weights (N,4)).
 
     Each path point's weight vector has two non-zero entries: its position
-    along the current segment contributes to the two adjacent electrodes.
+    along the current SEGMENT contributes to the two adjacent electrodes.
     A point halfway between e2 and e3 gets weights (0, 0.5, 0.5, 0), so its
-    local intensity = 0.5 * e2_val + 0.5 * e3_val - the "signal between
-    the points" behaviour."""
-    pts = np.array(electrodes_ordered, dtype=np.float32)  # (4, 2)
+    local intensity = 0.5 * e2_val + 0.5 * e3_val - the "signal between the
+    points" behaviour, now following a smooth curve instead of a zigzag."""
+    pts = [np.array(p, dtype=np.float64) for p in electrodes_ordered]
     n_electrodes = len(pts)
-    xys = []
-    weights = []
-    for i in range(n_electrodes - 1):
-        a, b = pts[i], pts[i + 1]
-        seg_len = float(np.linalg.norm(b - a))
-        n_samples = max(2, int(round(seg_len / spacing_px)))
-        for j in range(n_samples):
-            t = j / n_samples
-            pt = a + (b - a) * t
+    xys: list[tuple[float, float]] = []
+    weights: list[np.ndarray] = []
+    # Phantom endpoints for the spline
+    ctrl = [pts[0] + (pts[0] - pts[1])] + pts + [pts[-1] + (pts[-1] - pts[-2])]
+    for seg in range(n_electrodes - 1):
+        p0, p1, p2, p3 = (ctrl[seg + i] for i in range(4))
+        def knot(ti, a, b, alpha=0.5):
+            d = float(np.linalg.norm(b - a))
+            return ti + (d ** alpha if d > 0 else 1e-6)
+        t0 = 0.0
+        t1 = knot(t0, p0, p1)
+        t2 = knot(t1, p1, p2)
+        t3 = knot(t2, p2, p3)
+        chord = float(np.linalg.norm(p2 - p1))
+        n_samples = max(4, int(round(chord / spacing_px)))
+        for k in range(n_samples):
+            frac = k / n_samples
+            t = t1 + (t2 - t1) * frac
+            A1 = _safe_lerp(p0, p1, t0, t1, t)
+            A2 = _safe_lerp(p1, p2, t1, t2, t)
+            A3 = _safe_lerp(p2, p3, t2, t3, t)
+            B1 = _safe_lerp(A1, A2, t0, t2, t)
+            B2 = _safe_lerp(A2, A3, t1, t3, t)
+            C = _safe_lerp(B1, B2, t1, t2, t)
+            xys.append((float(C[0]), float(C[1])))
             w = np.zeros(n_electrodes, dtype=np.float32)
-            w[i] = 1.0 - t
-            w[i + 1] = t
-            xys.append(pt)
+            w[seg] = 1.0 - frac
+            w[seg + 1] = frac
             weights.append(w)
-    # Final endpoint
-    xys.append(pts[-1])
+    xys.append((float(pts[-1][0]), float(pts[-1][1])))
     final_w = np.zeros(n_electrodes, dtype=np.float32)
     final_w[-1] = 1.0
     weights.append(final_w)

@@ -141,16 +141,26 @@ class ElectrodeCanvas(tk.Frame):
             self.canvas.create_text(cx + MARKER_RADIUS + 4, cy, text=label,
                                     fill=color, font=("Arial", 13, "bold"),
                                     anchor="w", tags=("marker", label))
-        # Preview polyline
-        if len(self.electrodes) >= 2:
-            pts = []
-            for label in LABELS:
-                if label in self.electrodes:
-                    pts.append(self._img_to_canvas(*self.electrodes[label]))
-            for i in range(len(pts) - 1):
-                self.canvas.create_line(*pts[i], *pts[i + 1],
-                                        fill="#888", width=1, dash=(3, 3),
-                                        tags=("marker",))
+        # Preview path. With all 4 placed we draw the curved spline the
+        # render will actually trace; with 2 or 3 we fall back to straight
+        # segments through placed points.
+        placed = [lab for lab in LABELS if lab in self.electrodes]
+        if len(placed) == 4:
+            ordered = [self._img_to_canvas(*self.electrodes[lab]) for lab in LABELS]
+            curve = render_mod.catmull_rom_polyline(ordered, samples_per_segment=40)
+            flat = []
+            for x, y in curve:
+                flat.extend([int(x), int(y)])
+            if len(flat) >= 4:
+                self.canvas.create_line(*flat, fill="#aaa", width=1, dash=(4, 3),
+                                        tags=("marker",), smooth=False)
+        elif len(placed) >= 2:
+            flat = []
+            for lab in placed:
+                p = self._img_to_canvas(*self.electrodes[lab])
+                flat.extend(p)
+            self.canvas.create_line(*flat, fill="#888", width=1, dash=(3, 3),
+                                    tags=("marker",))
         if self.on_change:
             self.on_change()
 
