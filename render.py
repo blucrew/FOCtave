@@ -190,7 +190,9 @@ def render(
     duration_s: float | None,
     bloom_strength: float,
     base_dim_range: tuple[float, float],
+    progress=None,
 ) -> None:
+    """`progress` is an optional callable(fraction: float in [0,1], message: str)."""
     base = Image.open(image_path).convert("RGB")
     iw, ih = base.size
 
@@ -314,6 +316,9 @@ def render(
             frame = np.clip(canvas, 0, 255).astype(np.uint8)
             proc.stdin.write(frame.tobytes())
 
+            if progress is not None and i % max(1, fps // 2) == 0:
+                progress(i / max(1, n_frames),
+                         f"frame {i}/{n_frames}  ({100*i/max(1,n_frames):.1f}%)")
             if i % fps == 0 and i > 0:
                 elapsed = time.perf_counter() - t_start
                 fps_now = i / elapsed
@@ -327,6 +332,8 @@ def render(
         proc.wait()
 
     elapsed = time.perf_counter() - t_start
+    if progress is not None:
+        progress(1.0, f"Wrote {output.name}  ({elapsed:.1f}s)")
     print(f"Wrote {output}  ({elapsed:.1f}s render)")
 
 

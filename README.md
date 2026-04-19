@@ -27,13 +27,40 @@ routing.
 
 ```bash
 pip install -r requirements.txt
+```
+
+### All-in-one (GUI)
+
+```bash
+python studio.py
+```
+
+Opens FOCtave Studio - pick an audio file, pick an image, place four
+electrodes, choose a preset (and tweak knobs if you want), hit **Render**.
+Everything lands in `<output>/<project_name>/`:
+
+```
+my_project/
+    my_project.e1.funscript
+    my_project.e2.funscript
+    my_project.e3.funscript
+    my_project.e4.funscript
+    my_project.volume.funscript
+    my_project.electrodes.json
+    my_project.mp4
+```
+
+### Or just the funscripts (CLI)
+
+```bash
 python foctave.py path/to/your_track.wav
 ```
 
-That's it - five `.funscript` files appear next to the audio, and restim
-will auto-detect them when you point it at the matching media file.
+Five `.funscript` files appear next to the audio, and restim will
+auto-detect them when you point it at the matching media file.
 
-MP3 / M4A / OGG inputs work if `ffmpeg` is on your `PATH`.
+MP3 / M4A / OGG inputs work if `ffmpeg` is on your `PATH` (Studio uses a
+bundled copy via imageio-ffmpeg, so you don't need a system install).
 
 ---
 

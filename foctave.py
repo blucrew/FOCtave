@@ -131,14 +131,27 @@ def write_funscript_minimal(path: Path, values_0_1: np.ndarray, out_rate_hz: flo
 
 def convert(input_path: Path, out_dir: Path, out_rate_hz: float, smooth_hz: float,
             percentile: float, gamma: float, attack_ms: float, release_ms: float,
-            floor: float, volume_ramp_pct_per_min: float) -> None:
-    print(f"Loading {input_path}...")
+            floor: float, volume_ramp_pct_per_min: float,
+            output_stem: str | None = None,
+            progress=None) -> None:
+    """Convert a stereo audio file into FOCtave-style 4-phase funscripts.
+
+    `output_stem` overrides the filename stem used for outputs (defaults to
+    input_path.stem). `progress` is an optional callable(fraction: float in
+    [0,1], message: str) invoked at key steps.
+    """
+    def _p(f, msg):
+        if progress is not None:
+            progress(f, msg)
+        print(msg)
+
+    _p(0.05, f"Loading {input_path.name}...")
     stereo, sr = load_audio(input_path)
-    print(f"  {len(stereo)/sr:.1f}s @ {sr} Hz")
+    _p(0.15, f"  {len(stereo)/sr:.1f}s @ {sr} Hz")
 
     L, R = stereo[:, 0], stereo[:, 1]
 
-    print(f"Extracting envelopes (smoothed at {smooth_hz} Hz)...")
+    _p(0.25, f"Extracting envelopes (smoothed at {smooth_hz} Hz)...")
     L_env = envelope(L, sr, smooth_hz)
     R_env = envelope(R, sr, smooth_hz)
     V_env = envelope(np.sqrt(L * L + R * R), sr, smooth_hz)
@@ -146,45 +159,34 @@ def convert(input_path: Path, out_dir: Path, out_rate_hz: float, smooth_hz: floa
     step = int(round(sr / out_rate_hz))
     L_ds, R_ds, V_ds = L_env[::step], R_env[::step], V_env[::step]
 
-    print(f"Compressing (gamma={gamma}) and normalizing (percentile={percentile})...")
+    _p(0.55, f"Compressing (gamma={gamma}) and normalizing (percentile={percentile})...")
     L_n = normalize(compress_curve(L_ds, gamma), percentile)
     R_n = normalize(compress_curve(R_ds, gamma), percentile)
-    # Volume is a master-intensity channel; keep it linear so restim's own
-    # ramp and the user's master gain stay meaningful.
     V_n = normalize(V_ds, 99.5)
 
     if attack_ms > 0 or release_ms > 0:
-        print(f"Attack/release smoothing ({attack_ms}/{release_ms} ms)...")
+        _p(0.70, f"Attack/release smoothing ({attack_ms}/{release_ms} ms)...")
         L_n = asymmetric_smooth(L_n, out_rate_hz, attack_ms, release_ms)
         R_n = asymmetric_smooth(R_n, out_rate_hz, attack_ms, release_ms)
 
     if floor > 0:
-        print(f"Floor={floor:.2f}")
         L_n = apply_floor(L_n, floor)
         R_n = apply_floor(R_n, floor)
 
     if volume_ramp_pct_per_min > 0:
-        print(f"Volume ramp {volume_ramp_pct_per_min}%/min")
         V_n = apply_ramp(V_n, out_rate_hz, volume_ramp_pct_per_min)
 
-    stem = input_path.stem
+    stem = output_stem or input_path.stem
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # L envelope -> e1 and e2 (identical pair)
+    _p(0.85, "Writing funscripts...")
     for name in ("e1", "e2"):
-        p = out_dir / f"{stem}.{name}.funscript"
-        write_funscript_minimal(p, L_n, out_rate_hz)
-        print(f"  wrote {p}")
-    # R envelope -> e3 and e4 (identical pair)
+        write_funscript_minimal(out_dir / f"{stem}.{name}.funscript", L_n, out_rate_hz)
     for name in ("e3", "e4"):
-        p = out_dir / f"{stem}.{name}.funscript"
-        write_funscript_minimal(p, R_n, out_rate_hz)
-        print(f"  wrote {p}")
-    p = out_dir / f"{stem}.volume.funscript"
-    write_funscript_minimal(p, V_n, out_rate_hz)
-    print(f"  wrote {p}")
+        write_funscript_minimal(out_dir / f"{stem}.{name}.funscript", R_n, out_rate_hz)
+    write_funscript_minimal(out_dir / f"{stem}.volume.funscript", V_n, out_rate_hz)
 
-    print("Done.")
+    _p(1.0, f"Wrote {stem}.{{e1..e4, volume}}.funscript to {out_dir}")
 
 
 PRESETS = {
