@@ -38,8 +38,9 @@ except ImportError:
 
 CHANNELS = ["e1", "e2", "e3", "e4", "volume"]
 ELECTRODE_CHANNELS = ["e1", "e2", "e3", "e4"]
-ALL_PAIRS = [("e1", "e2"), ("e1", "e3"), ("e1", "e4"),
-             ("e2", "e3"), ("e2", "e4"), ("e3", "e4")]
+# Electrodes are visualised as a single polyline in order e1 -> e2 -> e3 -> e4,
+# matching the "snake head -> necktie -> snake belly -> snake tail" mental model
+# for a typical longitudinal 4-electrode placement.
 
 
 def load_funscript(path: Path) -> tuple[np.ndarray, np.ndarray]:
@@ -111,18 +112,71 @@ def stamp_glow(canvas: np.ndarray, cx: int, cy: int, stamp: np.ndarray,
         canvas[dy0:dy1, dx0:dx1, c] += patch * color[c]
 
 
-def draw_arc(canvas: np.ndarray, pa, pb, brightness: float,
-             color: tuple[float, float, float], thickness: int) -> None:
-    """Draw a straight additive arc between two points into the float32 canvas."""
-    if brightness <= 0:
-        return
-    # Rasterise via PIL then add
+def build_path(electrodes_ordered: list[tuple[int, int]],
+               spacing_px: float = 2.0) -> tuple[np.ndarray, np.ndarray]:
+    """Sample the polyline e1 -> e2 -> e3 -> e4 at ~every `spacing_px` and
+    return (xy int array shape (N,2), barycentric weights shape (N,4)).
+
+    Each path point's weight vector has two non-zero entries: its position
+    along the current segment contributes to the two adjacent electrodes.
+    A point halfway between e2 and e3 gets weights (0, 0.5, 0.5, 0), so its
+    local intensity = 0.5 * e2_val + 0.5 * e3_val - the "signal between
+    the points" behaviour."""
+    pts = np.array(electrodes_ordered, dtype=np.float32)  # (4, 2)
+    n_electrodes = len(pts)
+    xys = []
+    weights = []
+    for i in range(n_electrodes - 1):
+        a, b = pts[i], pts[i + 1]
+        seg_len = float(np.linalg.norm(b - a))
+        n_samples = max(2, int(round(seg_len / spacing_px)))
+        for j in range(n_samples):
+            t = j / n_samples
+            pt = a + (b - a) * t
+            w = np.zeros(n_electrodes, dtype=np.float32)
+            w[i] = 1.0 - t
+            w[i + 1] = t
+            xys.append(pt)
+            weights.append(w)
+    # Final endpoint
+    xys.append(pts[-1])
+    final_w = np.zeros(n_electrodes, dtype=np.float32)
+    final_w[-1] = 1.0
+    weights.append(final_w)
+    return np.array(xys).astype(np.int32), np.array(weights)
+
+
+def draw_path_ribbon(canvas: np.ndarray, path_xys: np.ndarray,
+                     path_intensities: np.ndarray, color: tuple[float, float, float],
+                     stamp: np.ndarray, thickness_scale: float) -> None:
+    """Stamp a small radial glow at each path point with brightness scaled
+    by that point's local intensity. Overlapping stamps add up, yielding a
+    continuous ribbon whose per-pixel brightness matches the interpolated
+    electrode values."""
     h, w = canvas.shape[:2]
-    mask = Image.new("L", (w, h), 0)
-    ImageDraw.Draw(mask).line([pa, pb], fill=int(brightness * 255), width=thickness)
-    mask_arr = np.array(mask, dtype=np.float32) / 255.0
-    for c in range(3):
-        canvas[..., c] += mask_arr * color[c] * brightness
+    sh = stamp.shape[0]
+    r_src = sh // 2
+
+    r_eff = max(2, int(r_src * thickness_scale))
+    idx = np.linspace(0, sh - 1, r_eff * 2 + 1).astype(np.int32)
+    stamp_small = stamp[idx][:, idx]  # resampled stamp (2r+1, 2r+1)
+    r = r_eff
+
+    for (x, y), intensity in zip(path_xys, path_intensities):
+        if intensity <= 0.05:
+            continue
+        x, y = int(x), int(y)
+        x0, x1 = x - r, x + r + 1
+        y0, y1 = y - r, y + r + 1
+        sx0 = max(0, -x0); sx1 = stamp_small.shape[1] - max(0, x1 - w)
+        sy0 = max(0, -y0); sy1 = stamp_small.shape[0] - max(0, y1 - h)
+        dx0 = max(0, x0); dx1 = min(w, x1)
+        dy0 = max(0, y0); dy1 = min(h, y1)
+        if dx0 >= dx1 or dy0 >= dy1:
+            continue
+        patch = stamp_small[sy0:sy1, sx0:sx1] * (intensity * 140.0)
+        for c in range(3):
+            canvas[dy0:dy1, dx0:dx1, c] += patch * color[c]
 
 
 def render(
@@ -167,9 +221,18 @@ def render(
     bloom_arr = np.array(base.filter(ImageFilter.GaussianBlur(radius=blur_radius)),
                          dtype=np.float32)
 
-    # Electrode glow stamp (pre-computed once)
+    # Electrode glow stamp (pre-computed once) - bigger for anchor points
     electrode_max_radius = int(min(w, h) * 0.18)
     stamp = precompute_glow_stamp(electrode_max_radius)
+
+    # Smaller stamp for the ribbon
+    ribbon_stamp = precompute_glow_stamp(int(min(w, h) * 0.035))
+
+    # Precompute the polyline through e1 -> e2 -> e3 -> e4
+    electrodes_ordered = [electrodes[ch] for ch in ELECTRODE_CHANNELS]
+    path_xys, path_weights = build_path(electrodes_ordered, spacing_px=2.0)
+    # Parameter along path, 0..1, for traveling-wave modulation
+    path_t = np.linspace(0.0, 1.0, len(path_xys), dtype=np.float32)
 
     # Duration
     total_ms = max(fs[0][-1] for fs in funscripts.values())
@@ -199,7 +262,7 @@ def render(
         "e3": (0.35, 1.00, 0.55),  # green-cyan
         "e4": (0.30, 0.70, 1.00),  # blue-cyan
     }
-    arc_color = (1.0, 0.75, 0.35)
+    ribbon_color = (1.0, 0.70, 0.30)  # warm amber for the flowing path
 
     import time
     t_start = time.perf_counter()
@@ -219,14 +282,21 @@ def render(
             dim = dim_lo + (dim_hi - dim_lo) * vol
             canvas = base_arr * dim + bloom_arr * (bloom_strength * vol)
 
-            # Arcs between all electrode pairs
-            for ea, eb in ALL_PAIRS:
-                va, vb = vals[ea], vals[eb]
-                flow = (va * vb) ** 0.5  # geometric mean
-                if flow > 0.08:
-                    thickness = max(2, int(min(w, h) * 0.003 * (0.5 + flow)))
-                    draw_arc(canvas, electrodes[ea], electrodes[eb],
-                             flow * 180, arc_color, thickness)
+            # Flowing ribbon along the polyline e1->e2->e3->e4.
+            # Interpolated intensity at every path point, modulated by a
+            # traveling wave so the signal visibly flows.
+            e_values = np.array([vals["e1"], vals["e2"], vals["e3"], vals["e4"]],
+                                dtype=np.float32)
+            path_intensity = path_weights @ e_values  # (N,)
+            # Traveling wave: phase advances with time, 2 full wavelengths
+            # along the path; modulates intensity by 60-100%.
+            t_s = t_ms / 1000.0
+            wave = 0.60 + 0.40 * np.sin(2 * np.pi * (path_t * 2.0 - t_s * 1.2))
+            path_intensity = path_intensity * wave
+            # Ribbon thickness subtly breathes with overall volume
+            ribbon_thickness = 0.55 + 0.45 * vol
+            draw_path_ribbon(canvas, path_xys, path_intensity, ribbon_color,
+                             ribbon_stamp, ribbon_thickness)
 
             # Electrode radial glows
             for ch in ELECTRODE_CHANNELS:

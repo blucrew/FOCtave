@@ -144,8 +144,30 @@ raw audio and restim will time against it the same way.
   glows when the action peaks)
 - Four radial glows at the clicked electrode positions - radius and
   brightness driven by e1, e2, e3, e4 values
-- Arcs between every pair of electrodes, brightest when both endpoints
-  are lit (visualises FOC-Stim's any-to-any current routing)
+- A flowing ribbon along the polyline e1 -> e2 -> e3 -> e4. The ribbon's
+  brightness at every point is the weighted average of the two nearest
+  electrode values, so a point midway between e2 and e3 literally feels
+  like `0.5 * e2 + 0.5 * e3`. A traveling-wave modulation makes the
+  signal visibly flow along the line instead of sitting static.
+
+The ribbon metaphor matches how longitudinal e-stim electrode placements
+actually feel - "snake head, necktie, snake belly, snake tail" - where
+sensation lives in the tissue *between* the electrodes, not just at them.
+
+### Example frames
+
+From a 12-second synthetic demo (see `examples/demo/`):
+
+| t = 2 s | t = 5 s | t = 11 s |
+|---|---|---|
+| ![low volume](examples/demo/frame_02s.png) | ![mid volume, gap between pairs](examples/demo/frame_05s.png) | ![late, bloom spread](examples/demo/frame_11s.png) |
+| e1/e2 pair throbbing, e3/e4 faint - you can see all four electrodes' assigned colors | e2/e3 both low mid-track, so the ribbon goes dark between them - the gap IS the data | Volume ramp has peaked; bloom spreads warm light into the base image |
+
+Reproduce locally with:
+
+```bash
+python render.py examples/demo/demo.jpg --max-dim 960 --bloom 0.6 --min-dim 0.65
+```
 
 ### Useful flags
 

@@ -26,6 +26,8 @@ out/
 
 # Electrode placements (user-specific, generated from click tool)
 *.electrodes.json
+# ...except inside examples/, where they're part of the shipped demo
+!examples/**/*.electrodes.json
 
 # OS
 .DS_Store
