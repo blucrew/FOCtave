@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Audio/video working files (large, not for distribution)
+*.wav
+*.mp3
+*.mp4
+*.flac
+*.m4a
+*.ogg
+
+# Generated funscripts (keep only in examples/ if committed explicitly)
+*.funscript
+
+# Comparison / scratch dirs
+_compare/
+_scratch/
+scratch/
+out/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
