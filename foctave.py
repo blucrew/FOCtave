@@ -187,33 +187,80 @@ def convert(input_path: Path, out_dir: Path, out_rate_hz: float, smooth_hz: floa
     print("Done.")
 
 
+PRESETS = {
+    # Faithful match to FunBelgium-style stereo-to-4-phase output:
+    # heavy saturation (pegged at 90-100 for ~60% of the time), no floor,
+    # no smoothing shaping, no auto ramp. This is the default.
+    "belgium": {
+        "gamma": 0.30, "percentile": 75.0,
+        "attack_ms": 0.0, "release_ms": 0.0,
+        "floor": 0.0, "volume_ramp": 0.0,
+    },
+    # Gentle: less compression, asymmetric smoothing for musical transients,
+    # small floor so quiet passages don't drop to zero. Good for easy-on
+    # sessions or first-time use with new electrode placement.
+    "comfort": {
+        "gamma": 0.40, "percentile": 85.0,
+        "attack_ms": 15.0, "release_ms": 120.0,
+        "floor": 0.05, "volume_ramp": 0.0,
+    },
+    # Dynamic: closer to the audio's actual loudness curve. Peak
+    # normalization with sqrt compression lets the track breathe - loud
+    # parts feel loud, quiet parts feel quiet. More faithful to the
+    # source material's arc.
+    "dynamic": {
+        "gamma": 0.50, "percentile": 95.0,
+        "attack_ms": 10.0, "release_ms": 80.0,
+        "floor": 0.03, "volume_ramp": 0.0,
+    },
+    # Long-session: moderate punch baseline + slow attack/release +
+    # comfort floor + 0.5%/min volume ramp (restim wiki recommendation),
+    # so intensity builds naturally over the course of a long track.
+    "endurance": {
+        "gamma": 0.35, "percentile": 80.0,
+        "attack_ms": 20.0, "release_ms": 150.0,
+        "floor": 0.08, "volume_ramp": 0.5,
+    },
+}
+
+
 def main() -> int:
+    # Two-pass parsing: grab --preset first so its values can serve as
+    # defaults for the main parser (with explicit flags still winning).
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--preset", choices=list(PRESETS), default="belgium")
+    preset_args, _ = pre.parse_known_args()
+    preset = PRESETS[preset_args.preset]
+
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input", type=Path)
     ap.add_argument("--out-dir", type=Path, default=None)
+    ap.add_argument("--preset", choices=list(PRESETS), default="belgium",
+                    help="Tuning preset: belgium (faithful match, default), "
+                         "comfort (gentle), dynamic (more faithful to audio), "
+                         "endurance (long-session with auto ramp). "
+                         "Individual flags below override the preset's values.")
     ap.add_argument("--rate", type=float, default=30.0,
-                    help="Funscript sample rate in Hz (default 30, matches FunBelgium style)")
+                    help="Funscript sample rate in Hz (default 30)")
     ap.add_argument("--smooth", type=float, default=20.0,
                     help="Envelope low-pass cutoff in Hz (default 20)")
-    ap.add_argument("--percentile", type=float, default=85.0,
-                    help="Normalization percentile (default 85; tuned vs FunBelgium. "
-                         "Use 100 for peak.)")
-    ap.add_argument("--gamma", type=float, default=0.33,
-                    help="Compression curve exponent (default 0.33 = cube root, "
-                         "tuned vs FunBelgium; 1.0 = linear; 0.5 = sqrt)")
-    ap.add_argument("--attack-ms", type=float, default=0.0,
-                    help="Attack time for asymmetric smoothing in ms "
-                         "(default 0 = symmetric; try 10-30 for musical feel)")
-    ap.add_argument("--release-ms", type=float, default=0.0,
-                    help="Release time for asymmetric smoothing in ms "
-                         "(default 0 = symmetric; try 80-200 for musical feel)")
-    ap.add_argument("--floor", type=float, default=0.0,
-                    help="Minimum intensity 0-1 (default 0; try 0.05-0.10 for comfort)")
-    ap.add_argument("--volume-ramp", type=float, default=0.0,
-                    help="Additive volume ramp in %%/minute (default 0; "
-                         "restim wiki suggests ~0.5)")
+    ap.add_argument("--percentile", type=float, default=preset["percentile"],
+                    help="Normalization percentile (preset-dependent; "
+                         "100 = peak. Lower = more saturation.)")
+    ap.add_argument("--gamma", type=float, default=preset["gamma"],
+                    help="Compression curve exponent (preset-dependent; "
+                         "1.0 = linear, 0.5 = sqrt, lower = punchier)")
+    ap.add_argument("--attack-ms", type=float, default=preset["attack_ms"],
+                    help="Attack time for asymmetric smoothing in ms")
+    ap.add_argument("--release-ms", type=float, default=preset["release_ms"],
+                    help="Release time for asymmetric smoothing in ms")
+    ap.add_argument("--floor", type=float, default=preset["floor"],
+                    help="Minimum intensity 0-1")
+    ap.add_argument("--volume-ramp", type=float, default=preset["volume_ramp"],
+                    help="Additive volume ramp in %%/minute")
     args = ap.parse_args()
 
+    print(f"Preset: {args.preset}")
     input_path = args.input.resolve()
     if not input_path.exists():
         print(f"Input not found: {input_path}", file=sys.stderr)

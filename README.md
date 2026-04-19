@@ -55,37 +55,45 @@ produce a close match to established stereo-to-4-phase conversion styles.
 
 ---
 
-## Tuning knobs
+## Presets
 
-| Flag | Default | What it does |
-|---|---|---|
-| `--rate` | `30` Hz | Funscript sample rate |
-| `--smooth` | `20` Hz | Envelope low-pass cutoff |
-| `--gamma` | `0.33` | Compression curve exponent (1.0 = linear, 0.5 = sqrt, 0.33 = cube root) |
-| `--percentile` | `85` | Normalization percentile (100 = peak) |
-| `--attack-ms` | `0` | Asymmetric attack time (try 10-30 for musical feel) |
-| `--release-ms` | `0` | Asymmetric release time (try 80-200 for musical feel) |
-| `--floor` | `0.0` | Minimum intensity 0-1 (try 0.05-0.10 for comfort) |
-| `--volume-ramp` | `0.0` | Additive ramp on the volume channel in %/minute |
-
-### Recommended "comfort" preset
+Four built-in presets cover the common use cases. Pick with `--preset`;
+defaults to `belgium`.
 
 ```bash
-python foctave.py input.wav --attack-ms 15 --release-ms 120 --floor 0.05
+python foctave.py input.wav                        # belgium (default)
+python foctave.py input.wav --preset comfort
+python foctave.py input.wav --preset dynamic
+python foctave.py input.wav --preset endurance
 ```
 
-- **Attack/release** gives transients punch while avoiding choppy cutoff.
-- **Floor** ensures quiet moments never drop to zero, which can feel like
-  the connection dropped.
+| Preset | gamma | percentile | attack / release | floor | vol ramp | Feel |
+|---|---:|---:|---:|---:|---:|---|
+| `belgium` | 0.30 | 75 | - | - | - | Faithful FunBelgium-style punch; e-channels pegged at 90-100 for ~60% of the track. |
+| `comfort` | 0.40 | 85 | 15 / 120 ms | 0.05 | - | Less saturated, musical transients, quiet sections never hit zero. Gentle. |
+| `dynamic` | 0.50 | 95 | 10 / 80 ms | 0.03 | - | Closer to the source audio's actual loudness curve — loud stays loud, quiet stays quiet. |
+| `endurance` | 0.35 | 80 | 20 / 150 ms | 0.08 | 0.5 %/min | Moderate baseline + gradual ramp-up over time. Designed for long tracks. |
 
-### Recommended "long-session" preset
+### Individual tuning knobs
+
+Any of these flags override the active preset:
+
+| Flag | What it does |
+|---|---|
+| `--rate` | Funscript sample rate in Hz (default 30) |
+| `--smooth` | Envelope low-pass cutoff in Hz (default 20) |
+| `--gamma` | Compression curve exponent. 1.0 = linear, 0.5 = sqrt, lower = punchier. |
+| `--percentile` | Normalization percentile (100 = peak). Lower = more saturation. |
+| `--attack-ms` | Asymmetric attack time (ms). Fast catches transients. |
+| `--release-ms` | Asymmetric release time (ms). Slow avoids choppy cutoff. |
+| `--floor` | Minimum intensity 0-1. Prevents "did it disconnect?" moments. |
+| `--volume-ramp` | Additive ramp on the volume channel in %/minute. |
+
+Example - start from `comfort` but crank saturation:
 
 ```bash
-python foctave.py input.wav --attack-ms 15 --release-ms 120 --floor 0.05 --volume-ramp 0.5
+python foctave.py input.wav --preset comfort --gamma 0.30 --percentile 75
 ```
-
-Adds a gradual 0.5%/min ramp on the volume channel (matches the restim wiki's
-suggestion for sustained sessions).
 
 ---
 
