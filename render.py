@@ -237,9 +237,47 @@ def draw_path_ribbon(canvas: np.ndarray, path_xys: np.ndarray,
             canvas[dy0:dy1, dx0:dx1, c] += patch * color[c]
 
 
-def render(
-    image_path: Path,
-    electrodes: dict,
+def _prepare_scene(image_path: Path, electrodes: dict, max_dim: int):
+    """Load, resize to match max_dim, pre-blur, and precompute the ribbon
+    path for one scene. Returns a dict with everything the render loop needs."""
+    base = Image.open(image_path).convert("RGB")
+    iw, ih = base.size
+    if max(iw, ih) > max_dim:
+        sf = max_dim / max(iw, ih)
+        nw, nh = int(iw * sf), int(ih * sf)
+        nw -= nw % 2
+        nh -= nh % 2
+        base = base.resize((nw, nh), Image.LANCZOS)
+        scaled = {k: (int(v[0] * sf), int(v[1] * sf)) for k, v in electrodes.items()}
+    else:
+        nw = iw - (iw % 2)
+        nh = ih - (ih % 2)
+        if (nw, nh) != (iw, ih):
+            base = base.crop((0, 0, nw, nh))
+        scaled = dict(electrodes)
+    w, h = nw, nh
+
+    base_arr = np.array(base, dtype=np.float32)
+    blur_radius = max(6, min(w, h) * 0.025)
+    bloom_arr = np.array(base.filter(ImageFilter.GaussianBlur(radius=blur_radius)),
+                         dtype=np.float32)
+    ordered = [scaled[ch] for ch in ELECTRODE_CHANNELS]
+    path_xys, path_weights = build_path(ordered, spacing_px=2.0)
+    path_t = np.linspace(0.0, 1.0, len(path_xys), dtype=np.float32)
+
+    return {
+        "w": w, "h": h,
+        "base_arr": base_arr,
+        "bloom_arr": bloom_arr,
+        "electrodes": scaled,
+        "path_xys": path_xys,
+        "path_weights": path_weights,
+        "path_t": path_t,
+    }
+
+
+def render_multi(
+    scenes: list,
     funscripts: dict,
     audio: Path | None,
     output: Path,
@@ -248,58 +286,85 @@ def render(
     duration_s: float | None,
     bloom_strength: float,
     base_dim_range: tuple[float, float],
+    scene_duration_s: float | None = None,
+    crossfade_s: float = 0.5,
     progress=None,
 ) -> None:
-    """`progress` is an optional callable(fraction: float in [0,1], message: str)."""
-    base = Image.open(image_path).convert("RGB")
-    iw, ih = base.size
+    """Render a video that rotates through a list of scenes. Each scene is a
+    dict with keys 'image_path' (Path) and 'electrodes' (dict e1..e4 -> (x,y)).
 
-    # Downscale for render if needed
-    if max(iw, ih) > max_dim:
-        sf = max_dim / max(iw, ih)
-        nw, nh = int(iw * sf), int(ih * sf)
-        # Pad to even dimensions for libx264
-        nw -= nw % 2
-        nh -= nh % 2
-        base = base.resize((nw, nh), Image.LANCZOS)
-        # Scale electrode positions
-        electrodes = {k: (int(v[0] * sf), int(v[1] * sf)) for k, v in electrodes.items()}
-    else:
-        sf = 1.0
-        nw = iw - (iw % 2)
-        nh = ih - (ih % 2)
-        if (nw, nh) != (iw, ih):
-            base = base.crop((0, 0, nw, nh))
+    With one scene this behaves exactly like single-image render.
+    With N scenes, the render rotates through them every `scene_duration_s`
+    seconds; if None, the total duration is divided evenly across scenes.
+    Between scenes, a `crossfade_s` crossfade blends the outgoing and
+    incoming frame."""
+    if not scenes:
+        raise ValueError("render_multi needs at least one scene")
 
-    w, h = nw, nh
-    print(f"Render size: {w}x{h} @ {fps}fps")
+    # First scene dictates output size
+    first = _prepare_scene(Path(scenes[0]["image_path"]),
+                            scenes[0]["electrodes"], max_dim)
+    w, h = first["w"], first["h"]
 
-    # Pre-compute: base as float, pre-blurred bloom copy
-    base_arr = np.array(base, dtype=np.float32)  # HxWx3 in [0,255]
-    blur_radius = max(6, min(w, h) * 0.025)
-    print(f"Pre-blurring bloom base (radius={blur_radius:.1f}px)...")
-    bloom_arr = np.array(base.filter(ImageFilter.GaussianBlur(radius=blur_radius)),
-                         dtype=np.float32)
-
-    # Electrode glow stamp (pre-computed once) - bigger for anchor points
-    electrode_max_radius = int(min(w, h) * 0.18)
-    stamp = precompute_glow_stamp(electrode_max_radius)
-
-    # Smaller stamp for the ribbon
-    ribbon_stamp = precompute_glow_stamp(int(min(w, h) * 0.035))
-
-    # Precompute the polyline through e1 -> e2 -> e3 -> e4
-    electrodes_ordered = [electrodes[ch] for ch in ELECTRODE_CHANNELS]
-    path_xys, path_weights = build_path(electrodes_ordered, spacing_px=2.0)
-    # Parameter along path, 0..1, for traveling-wave modulation
-    path_t = np.linspace(0.0, 1.0, len(path_xys), dtype=np.float32)
+    # Prepare every scene, forcing each to match the first scene's size so
+    # compositing is uniform. Resize if needed.
+    prepped = [first]
+    for s in scenes[1:]:
+        img = Image.open(Path(s["image_path"])).convert("RGB")
+        iw, ih = img.size
+        # Fit & center into (w, h): resize preserving aspect, then letterbox
+        scale_fit = min(w / iw, h / ih)
+        rw, rh = int(iw * scale_fit), int(ih * scale_fit)
+        img_r = img.resize((rw, rh), Image.LANCZOS)
+        canvas_img = Image.new("RGB", (w, h), (0, 0, 0))
+        ox, oy = (w - rw) // 2, (h - rh) // 2
+        canvas_img.paste(img_r, (ox, oy))
+        # Map original-space electrodes -> letterboxed canvas coords
+        fitted_elec = {k: (int(v[0] * scale_fit) + ox,
+                            int(v[1] * scale_fit) + oy)
+                       for k, v in s["electrodes"].items()}
+        base_arr = np.array(canvas_img, dtype=np.float32)
+        blur_radius = max(6, min(w, h) * 0.025)
+        bloom_arr = np.array(canvas_img.filter(ImageFilter.GaussianBlur(radius=blur_radius)),
+                             dtype=np.float32)
+        ordered = [fitted_elec[ch] for ch in ELECTRODE_CHANNELS]
+        path_xys, path_weights = build_path(ordered, spacing_px=2.0)
+        path_t = np.linspace(0.0, 1.0, len(path_xys), dtype=np.float32)
+        prepped.append({
+            "w": w, "h": h,
+            "base_arr": base_arr, "bloom_arr": bloom_arr,
+            "electrodes": fitted_elec,
+            "path_xys": path_xys, "path_weights": path_weights,
+            "path_t": path_t,
+        })
 
     # Duration
     total_ms = max(fs[0][-1] for fs in funscripts.values())
     if duration_s is not None:
         total_ms = min(total_ms, duration_s * 1000)
     n_frames = int(total_ms / 1000 * fps)
-    print(f"Rendering {n_frames} frames ({total_ms/1000:.1f}s)")
+    total_s = total_ms / 1000.0
+
+    n_scenes = len(prepped)
+    if scene_duration_s is None or scene_duration_s <= 0:
+        scene_duration_s = max(1.0, total_s / max(1, n_scenes))
+    crossfade_s = max(0.0, min(crossfade_s, scene_duration_s / 2))
+
+    print(f"Rendering {n_frames} frames ({total_s:.1f}s) across {n_scenes} scene(s); "
+          f"scene={scene_duration_s:.1f}s, crossfade={crossfade_s:.1f}s")
+
+    # Glow stamps are resolution-dependent but scene-independent
+    electrode_max_radius = int(min(w, h) * 0.18)
+    stamp = precompute_glow_stamp(electrode_max_radius)
+    ribbon_stamp = precompute_glow_stamp(int(min(w, h) * 0.035))
+
+    electrode_colors = {
+        "e1": (1.00, 0.35, 0.25),
+        "e2": (1.00, 0.55, 0.20),
+        "e3": (0.35, 1.00, 0.55),
+        "e4": (0.30, 0.70, 1.00),
+    }
+    ribbon_color = (1.0, 0.70, 0.30)
 
     # ffmpeg pipe
     cmd = [FFMPEG, "-y", "-loglevel", "error",
@@ -316,61 +381,65 @@ def render(
 
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
-    electrode_colors = {
-        "e1": (1.00, 0.35, 0.25),  # red-orange
-        "e2": (1.00, 0.55, 0.20),  # orange
-        "e3": (0.35, 1.00, 0.55),  # green-cyan
-        "e4": (0.30, 0.70, 1.00),  # blue-cyan
-    }
-    ribbon_color = (1.0, 0.70, 0.30)  # warm amber for the flowing path
-
     import time
     t_start = time.perf_counter()
+
+    def render_scene_frame(scene, vals, t_s):
+        vol = vals["volume"]
+        dim_lo, dim_hi = base_dim_range
+        dim = dim_lo + (dim_hi - dim_lo) * vol
+        canvas = scene["base_arr"] * dim + scene["bloom_arr"] * (bloom_strength * vol)
+        e_values = np.array([vals["e1"], vals["e2"], vals["e3"], vals["e4"]],
+                            dtype=np.float32)
+        path_intensity = scene["path_weights"] @ e_values
+        wave = 0.60 + 0.40 * np.sin(2 * np.pi * (scene["path_t"] * 2.0 - t_s * 1.2))
+        path_intensity = path_intensity * wave
+        ribbon_thickness = 0.55 + 0.45 * vol
+        draw_path_ribbon(canvas, scene["path_xys"], path_intensity, ribbon_color,
+                         ribbon_stamp, ribbon_thickness)
+        for ch in ELECTRODE_CHANNELS:
+            intensity = vals[ch]
+            if intensity <= 0.02:
+                continue
+            cx, cy = scene["electrodes"][ch]
+            stamp_glow(canvas, cx, cy, stamp,
+                       0.35 + 0.65 * intensity,
+                       electrode_colors[ch], 180 * intensity)
+        return canvas
 
     try:
         for i in range(n_frames):
             t_ms = i * 1000 / fps
-            vals = {}
-            for ch in CHANNELS:
-                times, positions = funscripts[ch]
-                vals[ch] = float(np.interp(t_ms, times, positions)) / 100.0
-
-            vol = vals["volume"]
-
-            # Base dimming + bloom
-            dim_lo, dim_hi = base_dim_range
-            dim = dim_lo + (dim_hi - dim_lo) * vol
-            canvas = base_arr * dim + bloom_arr * (bloom_strength * vol)
-
-            # Flowing ribbon along the polyline e1->e2->e3->e4.
-            # Interpolated intensity at every path point, modulated by a
-            # traveling wave so the signal visibly flows.
-            e_values = np.array([vals["e1"], vals["e2"], vals["e3"], vals["e4"]],
-                                dtype=np.float32)
-            path_intensity = path_weights @ e_values  # (N,)
-            # Traveling wave: phase advances with time, 2 full wavelengths
-            # along the path; modulates intensity by 60-100%.
             t_s = t_ms / 1000.0
-            wave = 0.60 + 0.40 * np.sin(2 * np.pi * (path_t * 2.0 - t_s * 1.2))
-            path_intensity = path_intensity * wave
-            # Ribbon thickness subtly breathes with overall volume
-            ribbon_thickness = 0.55 + 0.45 * vol
-            draw_path_ribbon(canvas, path_xys, path_intensity, ribbon_color,
-                             ribbon_stamp, ribbon_thickness)
+            vals = {ch: float(np.interp(t_ms, funscripts[ch][0], funscripts[ch][1])) / 100.0
+                    for ch in CHANNELS}
 
-            # Electrode radial glows
-            for ch in ELECTRODE_CHANNELS:
-                intensity = vals[ch]
-                if intensity <= 0.02:
-                    continue
-                cx, cy = electrodes[ch]
-                # Radius scales up with intensity; brightness too
-                r_scale = 0.35 + 0.65 * intensity
-                brightness = 180 * intensity
-                stamp_glow(canvas, cx, cy, stamp, r_scale,
-                           electrode_colors[ch], brightness)
+            # Scene scheduling. Each scene occupies [i*D, (i+1)*D) seconds.
+            # Crossfade happens in the first `crossfade_s` of each scene,
+            # blending from the previous scene into the current one.
+            if n_scenes == 1:
+                active = 0
+                fade_alpha = 1.0
+            else:
+                # Which scene index covers this time?
+                cur_idx = int(t_s // scene_duration_s) % n_scenes
+                t_in_scene = t_s - (t_s // scene_duration_s) * scene_duration_s
+                if t_in_scene < crossfade_s and (t_s >= scene_duration_s):
+                    # Crossfading from previous scene (cur_idx - 1) to current
+                    fade_alpha = t_in_scene / max(crossfade_s, 1e-6)
+                    prev_idx = (cur_idx - 1) % n_scenes
+                    frame_prev = render_scene_frame(prepped[prev_idx], vals, t_s)
+                    frame_cur = render_scene_frame(prepped[cur_idx], vals, t_s)
+                    canvas = frame_prev * (1.0 - fade_alpha) + frame_cur * fade_alpha
+                    active = cur_idx
+                else:
+                    active = cur_idx
+                    fade_alpha = 1.0
+                    canvas = render_scene_frame(prepped[active], vals, t_s)
 
-            # Clip and write
+            if n_scenes == 1:
+                canvas = render_scene_frame(prepped[0], vals, t_s)
+
             frame = np.clip(canvas, 0, 255).astype(np.uint8)
             proc.stdin.write(frame.tobytes())
 
@@ -381,8 +450,7 @@ def render(
                 elapsed = time.perf_counter() - t_start
                 fps_now = i / elapsed
                 eta = (n_frames - i) / max(fps_now, 0.01)
-                print(f"\r  frame {i}/{n_frames}  "
-                      f"({100*i/n_frames:5.1f}%)  "
+                print(f"\r  frame {i}/{n_frames}  ({100*i/n_frames:5.1f}%)  "
                       f"{fps_now:.1f}fps  ETA {eta:.0f}s", end="", flush=True)
         print()
     finally:
@@ -393,6 +461,34 @@ def render(
     if progress is not None:
         progress(1.0, f"Wrote {output.name}  ({elapsed:.1f}s)")
     print(f"Wrote {output}  ({elapsed:.1f}s render)")
+
+
+def render(
+    image_path: Path,
+    electrodes: dict,
+    funscripts: dict,
+    audio: Path | None,
+    output: Path,
+    fps: int,
+    max_dim: int,
+    duration_s: float | None,
+    bloom_strength: float,
+    base_dim_range: tuple[float, float],
+    progress=None,
+) -> None:
+    """Single-image convenience wrapper around render_multi."""
+    return render_multi(
+        scenes=[{"image_path": image_path, "electrodes": electrodes}],
+        funscripts=funscripts,
+        audio=audio,
+        output=output,
+        fps=fps,
+        max_dim=max_dim,
+        duration_s=duration_s,
+        bloom_strength=bloom_strength,
+        base_dim_range=base_dim_range,
+        progress=progress,
+    )
 
 
 def main() -> int:

@@ -1,23 +1,18 @@
 """
-FOCtave Studio — one-window GUI for the full pipeline.
+FOCtave Studio - one-window GUI for the full multi-image pipeline.
 
-Pick an audio file, pick an image, place electrodes, choose a preset, tune,
-hit Render. Everything for the project lands in a named subfolder of your
-chosen output directory:
+Pick an audio track, add one or more images, place electrodes on each,
+choose a preset, tune, hit Render. Each image's placement is also saved
+as a sidecar `<image>.electrodes.json` next to the image, so reusing the
+image in a future project auto-loads the placement - your image library
+builds itself as you work.
+
+Output layout per project:
 
     <output>/<project_name>/
-        <project>.e1.funscript
-        <project>.e2.funscript
-        <project>.e3.funscript
-        <project>.e4.funscript
-        <project>.volume.funscript
-        <project>.electrodes.json
+        <project>.{e1..e4, volume}.funscript
+        <project>.electrodes.json   (combined record of scenes)
         <project>.mp4
-
-Originals (audio, image) stay where they are - nothing gets copied.
-
-Usage:
-    python studio.py
 """
 
 import json
@@ -39,7 +34,6 @@ LABELS = ["e1", "e2", "e3", "e4"]
 COLORS = ["#ff4040", "#ffaa30", "#40ff60", "#40aaff"]
 MARKER_RADIUS = 12
 HIT_RADIUS = 18
-
 PRESETS = foctave.PRESETS
 
 
@@ -49,7 +43,7 @@ def slug(name: str) -> str:
 
 
 class ElectrodeCanvas(tk.Frame):
-    """Reusable canvas widget for placing/editing e1..e4 on an image."""
+    """Reusable canvas widget for placing e1..e4 on an image."""
 
     def __init__(self, master, on_change=None, **kw):
         super().__init__(master, bg="#111", **kw)
@@ -72,26 +66,18 @@ class ElectrodeCanvas(tk.Frame):
         self.canvas.bind("<Button-3>", self._on_right_click)
         self.canvas.bind("<Configure>", self._on_resize)
 
-    # --- Public API ---
-
-    def set_image(self, image_path: Path, existing_json: Path | None = None):
+    def set_image(self, image_path: Path | None, electrodes: dict | None = None):
+        if image_path is None:
+            self.image = None
+            self.electrodes = {}
+            self.canvas.delete("all")
+            if self.on_change:
+                self.on_change()
+            return
         self.image = Image.open(image_path).convert("RGB")
-        self.electrodes = {}
-        if existing_json and existing_json.exists():
-            try:
-                data = json.loads(existing_json.read_text(encoding="utf-8"))
-                for label, pos in data.get("electrodes", {}).items():
-                    if label in LABELS:
-                        self.electrodes[label] = (int(pos["x"]), int(pos["y"]))
-            except Exception:
-                pass
+        self.electrodes = dict(electrodes or {})
         self._fit()
         self._redraw()
-
-    def clear_image(self):
-        self.image = None
-        self.electrodes = {}
-        self.canvas.delete("all")
 
     def reset_placements(self):
         self.electrodes = {}
@@ -102,8 +88,6 @@ class ElectrodeCanvas(tk.Frame):
 
     def all_placed(self) -> bool:
         return len(self.electrodes) == 4
-
-    # --- Internals ---
 
     def _fit(self):
         if self.image is None:
@@ -141,9 +125,6 @@ class ElectrodeCanvas(tk.Frame):
             self.canvas.create_text(cx + MARKER_RADIUS + 4, cy, text=label,
                                     fill=color, font=("Arial", 13, "bold"),
                                     anchor="w", tags=("marker", label))
-        # Preview path. With all 4 placed we draw the curved spline the
-        # render will actually trace; with 2 or 3 we fall back to straight
-        # segments through placed points.
         placed = [lab for lab in LABELS if lab in self.electrodes]
         if len(placed) == 4:
             ordered = [self._img_to_canvas(*self.electrodes[lab]) for lab in LABELS]
@@ -157,8 +138,7 @@ class ElectrodeCanvas(tk.Frame):
         elif len(placed) >= 2:
             flat = []
             for lab in placed:
-                p = self._img_to_canvas(*self.electrodes[lab])
-                flat.extend(p)
+                flat.extend(self._img_to_canvas(*self.electrodes[lab]))
             self.canvas.create_line(*flat, fill="#888", width=1, dash=(3, 3),
                                     tags=("marker",))
         if self.on_change:
@@ -210,15 +190,13 @@ class ElectrodeCanvas(tk.Frame):
         nxt = self._next_unplaced()
         if nxt is None:
             return
-        ix, iy = self._canvas_to_img(event.x, event.y)
-        self.electrodes[nxt] = (ix, iy)
+        self.electrodes[nxt] = self._canvas_to_img(event.x, event.y)
         self._redraw()
 
     def _on_drag(self, event):
         if self.drag_target is None or self.image is None:
             return
-        ix, iy = self._canvas_to_img(event.x, event.y)
-        self.electrodes[self.drag_target] = (ix, iy)
+        self.electrodes[self.drag_target] = self._canvas_to_img(event.x, event.y)
         self._redraw()
 
     def _on_release(self, _event):
@@ -241,14 +219,17 @@ class StudioApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("FOCtave Studio")
-        self.root.geometry("1400x900")
-        self.root.minsize(900, 650)
+        self.root.geometry("1500x900")
+        self.root.minsize(1000, 650)
 
         self.audio_path = tk.StringVar()
-        self.image_path = tk.StringVar()
         self.output_dir = tk.StringVar()
         self.project_name = tk.StringVar(value="untitled")
         self.preset_var = tk.StringVar(value="belgium")
+
+        # Scenes: list[{"path": Path, "electrodes": dict}]
+        self.scenes: list[dict] = []
+        self.active_scene_idx: int = -1
 
         self.tune_vars = {
             "gamma": tk.DoubleVar(value=0.30),
@@ -264,60 +245,126 @@ class StudioApp:
             "bloom": tk.DoubleVar(value=0.45),
             "min_dim": tk.DoubleVar(value=0.55),
         }
-        self.status_var = tk.StringVar(value="Pick an audio track and an image to begin.")
+        self.scene_duration_var = tk.DoubleVar(value=20.0)
+        self.crossfade_var = tk.DoubleVar(value=0.5)
+        self.crossfade_enabled = tk.BooleanVar(value=True)
+
+        self.status_var = tk.StringVar(value="Pick an audio track and add an image to begin.")
         self.progress_var = tk.DoubleVar(value=0.0)
         self.render_busy = False
 
         self._build_top()
         self._build_main()
         self._build_bottom()
+        self._apply_preset()
 
-        self._apply_preset()  # initialise tune vars to belgium defaults
-
-        # Thread-safe queue for progress updates from worker thread
         self.ui_queue: queue.Queue = queue.Queue()
         self.root.after(50, self._drain_queue)
 
-    # --- UI ---
+    # --- Top (file pickers) ---
 
     def _build_top(self):
         top = tk.Frame(self.root, bg="#1e1e1e")
         top.pack(side="top", fill="x", padx=6, pady=6)
+        LW, EW = 9, 62
 
-        LABEL_WIDTH = 9      # uniform label column
-        ENTRY_WIDTH = 62     # characters; scrollable if path is longer
-
-        # Row 0 - Project (editable text)
-        tk.Label(top, text="Project:", width=LABEL_WIDTH, anchor="w",
+        tk.Label(top, text="Project:", width=LW, anchor="w",
                  fg="#ddd", bg="#1e1e1e").grid(row=0, column=0, sticky="w", padx=(4, 6))
-        ttk.Entry(top, textvariable=self.project_name, width=ENTRY_WIDTH).grid(
+        ttk.Entry(top, textvariable=self.project_name, width=EW).grid(
             row=0, column=1, sticky="w", pady=2)
-        tk.Label(top, text="(used for folder + file names)",
-                 fg="#777", bg="#1e1e1e").grid(row=0, column=2, sticky="w", padx=10)
+        tk.Label(top, text="(folder + file stem)", fg="#777", bg="#1e1e1e").grid(
+            row=0, column=2, sticky="w", padx=10)
 
-        # Rows 1-3 - file pickers: read-only path display + Browse button
         def file_row(row, label, var, cb):
-            tk.Label(top, text=label, width=LABEL_WIDTH, anchor="w",
+            tk.Label(top, text=label, width=LW, anchor="w",
                      fg="#ddd", bg="#1e1e1e").grid(row=row, column=0, sticky="w", padx=(4, 6))
-            entry = ttk.Entry(top, textvariable=var, width=ENTRY_WIDTH, state="readonly")
-            entry.grid(row=row, column=1, sticky="w", pady=2)
+            ttk.Entry(top, textvariable=var, width=EW, state="readonly").grid(
+                row=row, column=1, sticky="w", pady=2)
             ttk.Button(top, text="Browse…", command=cb, width=10).grid(
                 row=row, column=2, sticky="w", padx=(6, 4), pady=2)
 
         file_row(1, "Audio:", self.audio_path, self._browse_audio)
-        file_row(2, "Image:", self.image_path, self._browse_image)
-        file_row(3, "Output:", self.output_dir, self._browse_output)
+        file_row(2, "Output:", self.output_dir, self._browse_output)
+
+    # --- Main (scenes panel + canvas + controls panel) ---
 
     def _build_main(self):
         main = tk.Frame(self.root)
         main.pack(side="top", fill="both", expand=True)
 
-        # Image canvas (left, expands)
+        # Left: scenes panel
+        self._build_scenes_panel(main)
+
+        # Middle: image canvas
         self.canvas_widget = ElectrodeCanvas(main, on_change=self._on_canvas_change)
         self.canvas_widget.pack(side="left", fill="both", expand=True)
 
-        # Right control panel
-        panel = tk.Frame(main, bg="#1e1e1e", width=320)
+        # Right: controls panel
+        self._build_controls_panel(main)
+
+    def _build_scenes_panel(self, parent):
+        panel = tk.Frame(parent, bg="#1a1a1a", width=240)
+        panel.pack(side="left", fill="y")
+        panel.pack_propagate(False)
+
+        tk.Label(panel, text="Scenes", fg="#fff", bg="#1a1a1a",
+                 font=("Arial", 11, "bold")).pack(anchor="w", padx=10, pady=(10, 2))
+        tk.Label(panel, text="Images rotate through\nthe video in order.",
+                 fg="#888", bg="#1a1a1a", font=("Arial", 8),
+                 justify="left").pack(anchor="w", padx=10, pady=(0, 6))
+
+        lb_frame = tk.Frame(panel, bg="#1a1a1a")
+        lb_frame.pack(fill="both", expand=True, padx=6, pady=2)
+        sb = ttk.Scrollbar(lb_frame, orient="vertical")
+        self.scene_listbox = tk.Listbox(lb_frame, bg="#0f0f0f", fg="#ddd",
+                                        selectbackground="#3a6",
+                                        selectforeground="#fff",
+                                        highlightthickness=0, activestyle="none",
+                                        font=("Consolas", 9),
+                                        yscrollcommand=sb.set, exportselection=False)
+        sb.config(command=self.scene_listbox.yview)
+        sb.pack(side="right", fill="y")
+        self.scene_listbox.pack(side="left", fill="both", expand=True)
+        self.scene_listbox.bind("<<ListboxSelect>>", self._on_scene_select)
+
+        btns = tk.Frame(panel, bg="#1a1a1a")
+        btns.pack(fill="x", padx=6, pady=4)
+        ttk.Button(btns, text="+ Add image", command=self._add_scene).pack(side="left", padx=2)
+        ttk.Button(btns, text="− Remove", command=self._remove_scene).pack(side="left", padx=2)
+
+        ttk.Separator(panel, orient="horizontal").pack(fill="x", pady=6, padx=8)
+
+        # Rotation controls
+        tk.Label(panel, text="Rotation", fg="#fff", bg="#1a1a1a",
+                 font=("Arial", 10, "bold")).pack(anchor="w", padx=10)
+        row = tk.Frame(panel, bg="#1a1a1a")
+        row.pack(fill="x", padx=10, pady=2)
+        tk.Label(row, text="every", width=6, anchor="w",
+                 fg="#ddd", bg="#1a1a1a").pack(side="left")
+        ttk.Spinbox(row, from_=1.0, to=600.0, increment=1.0,
+                    textvariable=self.scene_duration_var,
+                    format="%.1f", width=7).pack(side="left")
+        tk.Label(row, text="sec", fg="#ddd", bg="#1a1a1a").pack(side="left", padx=4)
+
+        row2 = tk.Frame(panel, bg="#1a1a1a")
+        row2.pack(fill="x", padx=10, pady=2)
+        ttk.Checkbutton(row2, text="crossfade",
+                        variable=self.crossfade_enabled).pack(side="left")
+        ttk.Spinbox(row2, from_=0.0, to=3.0, increment=0.1,
+                    textvariable=self.crossfade_var,
+                    format="%.1f", width=6).pack(side="right")
+
+        ttk.Separator(panel, orient="horizontal").pack(fill="x", pady=6, padx=8)
+
+        # Electrodes info
+        self.electrode_count_label = tk.Label(panel, text="Electrodes: 0/4",
+                                              fg="#ddd", bg="#1a1a1a")
+        self.electrode_count_label.pack(anchor="w", padx=10, pady=2)
+        ttk.Button(panel, text="Reset this scene's electrodes",
+                   command=self._reset_electrodes).pack(fill="x", padx=10, pady=(2, 10))
+
+    def _build_controls_panel(self, parent):
+        panel = tk.Frame(parent, bg="#1e1e1e", width=320)
         panel.pack(side="right", fill="y")
         panel.pack_propagate(False)
 
@@ -325,14 +372,12 @@ class StudioApp:
         tk.Label(panel, text="Preset", fg="#fff", bg="#1e1e1e",
                  font=("Arial", 11, "bold")).pack(anchor="w", padx=10, pady=(10, 2))
         for name in PRESETS.keys():
-            rb = ttk.Radiobutton(panel, text=name, value=name,
-                                 variable=self.preset_var,
-                                 command=self._apply_preset)
-            rb.pack(anchor="w", padx=20)
+            ttk.Radiobutton(panel, text=name, value=name,
+                            variable=self.preset_var,
+                            command=self._apply_preset).pack(anchor="w", padx=20)
 
         ttk.Separator(panel, orient="horizontal").pack(fill="x", pady=8, padx=10)
 
-        # Tuning
         tk.Label(panel, text="Tuning", fg="#fff", bg="#1e1e1e",
                  font=("Arial", 11, "bold")).pack(anchor="w", padx=10)
 
@@ -341,9 +386,8 @@ class StudioApp:
             f.pack(fill="x", padx=10, pady=2)
             tk.Label(f, text=label, width=12, anchor="w",
                      fg="#ddd", bg="#1e1e1e").pack(side="left")
-            sb = ttk.Spinbox(f, from_=frm, to=to, increment=inc,
-                             textvariable=var, format=fmt, width=8)
-            sb.pack(side="right")
+            ttk.Spinbox(f, from_=frm, to=to, increment=inc,
+                        textvariable=var, format=fmt, width=8).pack(side="right")
 
         tune_row(panel, "gamma", self.tune_vars["gamma"], 0.1, 1.0, 0.05)
         tune_row(panel, "percentile", self.tune_vars["percentile"], 50.0, 100.0, 1.0, "%.0f")
@@ -354,7 +398,6 @@ class StudioApp:
 
         ttk.Separator(panel, orient="horizontal").pack(fill="x", pady=8, padx=10)
 
-        # Video
         tk.Label(panel, text="Video", fg="#fff", bg="#1e1e1e",
                  font=("Arial", 11, "bold")).pack(anchor="w", padx=10)
         tune_row(panel, "max dim (px)", self.video_vars["max_dim"], 480, 3840, 160, "%.0f")
@@ -362,33 +405,20 @@ class StudioApp:
         tune_row(panel, "bloom", self.video_vars["bloom"], 0.0, 1.0, 0.05)
         tune_row(panel, "min dim (base)", self.video_vars["min_dim"], 0.1, 1.0, 0.05)
 
-        ttk.Separator(panel, orient="horizontal").pack(fill="x", pady=8, padx=10)
-
-        # Electrodes info + reset
-        self.electrode_count_label = tk.Label(panel, text="Electrodes: 0/4",
-                                              fg="#ddd", bg="#1e1e1e")
-        self.electrode_count_label.pack(anchor="w", padx=10, pady=3)
-        ttk.Button(panel, text="Reset electrodes",
-                   command=self._reset_electrodes).pack(fill="x", padx=10, pady=4)
-
     def _build_bottom(self):
         bot = tk.Frame(self.root, bg="#1e1e1e")
         bot.pack(side="bottom", fill="x")
-
         self.render_button = ttk.Button(bot, text="▶  Render video",
                                         command=self._start_render)
         self.render_button.pack(side="right", padx=10, pady=6)
-
         self.progress_bar = ttk.Progressbar(bot, orient="horizontal",
                                             mode="determinate",
                                             variable=self.progress_var,
                                             maximum=100.0)
         self.progress_bar.pack(side="right", fill="x", expand=True,
                                padx=10, pady=6)
-
-        self.status_label = tk.Label(bot, textvariable=self.status_var,
-                                     anchor="w", fg="#ddd", bg="#1e1e1e")
-        self.status_label.pack(side="left", fill="x", padx=10, pady=6)
+        tk.Label(bot, textvariable=self.status_var,
+                 anchor="w", fg="#ddd", bg="#1e1e1e").pack(side="left", fill="x", padx=10, pady=6)
 
     # --- File browsers ---
 
@@ -400,33 +430,112 @@ class StudioApp:
             self.audio_path.set(p)
             self._autofill_output()
 
-    def _browse_image(self):
-        p = filedialog.askopenfilename(
-            title="Select image",
-            filetypes=[("Images", "*.jpg *.jpeg *.png *.webp *.bmp"), ("All", "*.*")])
-        if p:
-            self.image_path.set(p)
-            img_path = Path(p)
-            ep = img_path.with_suffix(".electrodes.json")
-            self.canvas_widget.set_image(img_path, existing_json=ep)
-            self._autofill_output()
-            self._on_canvas_change()
-
     def _browse_output(self):
         p = filedialog.askdirectory(title="Select output folder")
         if p:
             self.output_dir.set(p)
 
     def _autofill_output(self):
-        """When either source is picked, default output dir to image's parent."""
         if self.output_dir.get():
             return
-        for var in (self.image_path, self.audio_path):
-            if var.get():
-                self.output_dir.set(str(Path(var.get()).parent))
-                return
+        if self.audio_path.get():
+            self.output_dir.set(str(Path(self.audio_path.get()).parent))
+            return
+        if self.scenes:
+            self.output_dir.set(str(Path(self.scenes[0]["path"]).parent))
 
-    # --- Preset / tune sync ---
+    # --- Scene management ---
+
+    def _add_scene(self):
+        paths = filedialog.askopenfilenames(
+            title="Select image(s) to add",
+            filetypes=[("Images", "*.jpg *.jpeg *.png *.webp *.bmp"), ("All", "*.*")])
+        if not paths:
+            return
+        for p in paths:
+            pth = Path(p).resolve()
+            # Library auto-load from sidecar
+            sidecar = pth.with_suffix(".electrodes.json")
+            electrodes = {}
+            if sidecar.exists():
+                try:
+                    data = json.loads(sidecar.read_text(encoding="utf-8"))
+                    for lab, pos in data.get("electrodes", {}).items():
+                        if lab in LABELS:
+                            electrodes[lab] = (int(pos["x"]), int(pos["y"]))
+                except Exception:
+                    pass
+            self.scenes.append({"path": pth, "electrodes": electrodes})
+        self._refresh_scene_list()
+        # Auto-select the first added scene if nothing was selected
+        if self.active_scene_idx < 0:
+            self.active_scene_idx = 0
+            self._load_active_scene()
+        self._autofill_output()
+
+    def _remove_scene(self):
+        if self.active_scene_idx < 0 or not self.scenes:
+            return
+        idx = self.active_scene_idx
+        del self.scenes[idx]
+        if not self.scenes:
+            self.active_scene_idx = -1
+            self.canvas_widget.set_image(None)
+        else:
+            self.active_scene_idx = min(idx, len(self.scenes) - 1)
+            self._load_active_scene()
+        self._refresh_scene_list()
+
+    def _refresh_scene_list(self):
+        self.scene_listbox.delete(0, tk.END)
+        for i, scene in enumerate(self.scenes):
+            placed = len(scene["electrodes"])
+            name = Path(scene["path"]).name
+            short = name if len(name) <= 22 else name[:19] + "..."
+            self.scene_listbox.insert(tk.END, f"{short} ({placed}/4)")
+        if 0 <= self.active_scene_idx < len(self.scenes):
+            self.scene_listbox.selection_set(self.active_scene_idx)
+            self.scene_listbox.see(self.active_scene_idx)
+
+    def _on_scene_select(self, _event):
+        sel = self.scene_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        # Save current scene's placements back before switching
+        if 0 <= self.active_scene_idx < len(self.scenes):
+            self.scenes[self.active_scene_idx]["electrodes"] = self.canvas_widget.get_electrodes()
+        self.active_scene_idx = idx
+        self._load_active_scene()
+
+    def _load_active_scene(self):
+        if self.active_scene_idx < 0 or self.active_scene_idx >= len(self.scenes):
+            self.canvas_widget.set_image(None)
+            return
+        s = self.scenes[self.active_scene_idx]
+        self.canvas_widget.set_image(s["path"], electrodes=s["electrodes"])
+
+    def _on_canvas_change(self):
+        if 0 <= self.active_scene_idx < len(self.scenes):
+            self.scenes[self.active_scene_idx]["electrodes"] = self.canvas_widget.get_electrodes()
+            # Update listbox entry in place
+            placed = len(self.scenes[self.active_scene_idx]["electrodes"])
+            name = Path(self.scenes[self.active_scene_idx]["path"]).name
+            short = name if len(name) <= 22 else name[:19] + "..."
+            self.scene_listbox.delete(self.active_scene_idx)
+            self.scene_listbox.insert(self.active_scene_idx, f"{short} ({placed}/4)")
+            self.scene_listbox.selection_set(self.active_scene_idx)
+        n = len(self.canvas_widget.get_electrodes())
+        self.electrode_count_label.config(text=f"Electrodes: {n}/4")
+
+    def _reset_electrodes(self):
+        if not self.canvas_widget.get_electrodes():
+            return
+        if messagebox.askyesno("Reset", "Clear placements on the current scene?"):
+            self.canvas_widget.reset_placements()
+            self._on_canvas_change()
+
+    # --- Preset sync ---
 
     def _apply_preset(self):
         p = PRESETS[self.preset_var.get()]
@@ -435,42 +544,37 @@ class StudioApp:
                 self.tune_vars[k].set(v)
         self.status_var.set(f"Preset: {self.preset_var.get()}")
 
-    def _on_canvas_change(self):
-        n = len(self.canvas_widget.get_electrodes())
-        self.electrode_count_label.config(text=f"Electrodes: {n}/4")
-
-    def _reset_electrodes(self):
-        if not self.canvas_widget.get_electrodes():
-            return
-        if messagebox.askyesno("Reset", "Clear all placed electrodes?"):
-            self.canvas_widget.reset_placements()
-            self._on_canvas_change()
-
     # --- Rendering ---
 
     def _start_render(self):
         if self.render_busy:
             return
-        # Validate
         name = slug(self.project_name.get())
         audio = self.audio_path.get().strip()
-        image = self.image_path.get().strip()
         outdir = self.output_dir.get().strip()
 
         if not audio or not Path(audio).exists():
             messagebox.showerror("Audio missing", "Pick a valid audio file first.")
             return
-        if not image or not Path(image).exists():
-            messagebox.showerror("Image missing", "Pick a valid image first.")
+        if not self.scenes:
+            messagebox.showerror("No scenes", "Add at least one image first.")
             return
         if not outdir:
             messagebox.showerror("Output missing", "Pick an output folder first.")
             return
-        if not self.canvas_widget.all_placed():
+
+        # Sync current canvas back to active scene before we snapshot
+        if 0 <= self.active_scene_idx < len(self.scenes):
+            self.scenes[self.active_scene_idx]["electrodes"] = self.canvas_widget.get_electrodes()
+
+        incomplete = [i for i, s in enumerate(self.scenes) if len(s["electrodes"]) != 4]
+        if incomplete:
+            names = ", ".join(Path(self.scenes[i]["path"]).name for i in incomplete[:3])
+            more = "" if len(incomplete) <= 3 else f" +{len(incomplete)-3} more"
             if not messagebox.askyesno(
-                "Incomplete placement",
-                f"Only {len(self.canvas_widget.get_electrodes())}/4 electrodes placed. "
-                "The ribbon needs all 4 to render meaningfully. Render anyway?"):
+                "Incomplete placements",
+                f"{len(incomplete)} scene(s) missing electrodes: {names}{more}.\n"
+                "Render anyway?"):
                 return
 
         self.render_busy = True
@@ -478,34 +582,54 @@ class StudioApp:
         self.progress_var.set(0.0)
         self.status_var.set("Starting…")
 
+        scenes_snapshot = [{"path": Path(s["path"]), "electrodes": dict(s["electrodes"])}
+                           for s in self.scenes]
+
         t = threading.Thread(
             target=self._render_worker,
-            args=(name, Path(audio), Path(image), Path(outdir),
-                  dict(self.canvas_widget.get_electrodes()),
+            args=(name, Path(audio), Path(outdir), scenes_snapshot,
                   {k: v.get() for k, v in self.tune_vars.items()},
-                  {k: v.get() for k, v in self.video_vars.items()}),
+                  {k: v.get() for k, v in self.video_vars.items()},
+                  float(self.scene_duration_var.get()),
+                  float(self.crossfade_var.get()) if self.crossfade_enabled.get() else 0.0),
             daemon=True,
         )
         t.start()
 
-    def _render_worker(self, name, audio, image, outdir, electrodes, tune, video):
+    def _render_worker(self, name, audio, outdir, scenes, tune, video,
+                       scene_duration_s, crossfade_s):
         try:
             proj_dir = outdir / name
             proj_dir.mkdir(parents=True, exist_ok=True)
 
-            # 1. Save electrodes.json
-            iw, ih = Image.open(image).size
-            electrodes_json = proj_dir / f"{name}.electrodes.json"
-            electrodes_json.write_text(json.dumps({
-                "image": image.name,
-                "image_size": {"w": iw, "h": ih},
-                "electrodes": {k: {"x": v[0], "y": v[1]} for k, v in electrodes.items()},
-            }, indent=2))
-            self._post_status("Saved electrodes.json", 0.02)
+            # 1. Save combined scenes JSON for the project + update per-image sidecars
+            combined = {"scenes": []}
+            for s in scenes:
+                img_path = s["path"]
+                iw, ih = Image.open(img_path).size
+                entry = {
+                    "image": str(img_path),
+                    "image_size": {"w": iw, "h": ih},
+                    "electrodes": {k: {"x": v[0], "y": v[1]} for k, v in s["electrodes"].items()},
+                }
+                combined["scenes"].append(entry)
+                # Library sidecar next to the original image
+                sidecar = img_path.with_suffix(".electrodes.json")
+                try:
+                    sidecar.write_text(json.dumps({
+                        "image": img_path.name,
+                        "image_size": {"w": iw, "h": ih},
+                        "electrodes": entry["electrodes"],
+                    }, indent=2), encoding="utf-8")
+                except Exception as e:
+                    print(f"Warning: couldn't write library sidecar {sidecar}: {e}")
+
+            (proj_dir / f"{name}.electrodes.json").write_text(
+                json.dumps(combined, indent=2), encoding="utf-8")
+            self._post_status("Saved scenes and library sidecars", 0.02)
 
             # 2. Convert audio -> funscripts
             def convert_progress(frac, msg):
-                # Map to 0..40% of total progress
                 self._post_status(msg, 0.02 + frac * 0.38)
 
             foctave.convert(
@@ -524,21 +648,21 @@ class StudioApp:
             )
 
             # 3. Load funscripts back for render
-            funscripts = {}
-            for ch in ["e1", "e2", "e3", "e4", "volume"]:
-                funscripts[ch] = render_mod.load_funscript(
-                    proj_dir / f"{name}.{ch}.funscript")
+            funscripts = {ch: render_mod.load_funscript(
+                proj_dir / f"{name}.{ch}.funscript")
+                for ch in ["e1", "e2", "e3", "e4", "volume"]}
 
             # 4. Render video
             output_mp4 = proj_dir / f"{name}.mp4"
 
             def render_progress(frac, msg):
-                # Map to 40..100% of total progress
                 self._post_status(msg, 0.40 + frac * 0.60)
 
-            render_mod.render(
-                image_path=image,
-                electrodes=electrodes,
+            render_scenes = [{"image_path": s["path"], "electrodes": s["electrodes"]}
+                             for s in scenes]
+
+            render_mod.render_multi(
+                scenes=render_scenes,
                 funscripts=funscripts,
                 audio=audio,
                 output=output_mp4,
@@ -547,6 +671,8 @@ class StudioApp:
                 duration_s=None,
                 bloom_strength=video["bloom"],
                 base_dim_range=(video["min_dim"], 1.0),
+                scene_duration_s=scene_duration_s,
+                crossfade_s=crossfade_s,
                 progress=render_progress,
             )
 
@@ -557,8 +683,7 @@ class StudioApp:
             traceback.print_exc()
             self._post_status(f"Error: {e}", self.progress_var.get(), done=True)
 
-    def _post_status(self, msg: str, fraction: float, done: bool = False,
-                     final_folder: Path | None = None):
+    def _post_status(self, msg, fraction, done=False, final_folder=None):
         self.ui_queue.put((msg, fraction, done, final_folder))
 
     def _drain_queue(self):
@@ -574,7 +699,7 @@ class StudioApp:
                         if messagebox.askyesno("Render complete",
                                                f"Output: {final_folder}\n\nOpen folder?"):
                             import os
-                            os.startfile(final_folder)  # Windows
+                            os.startfile(final_folder)
         except queue.Empty:
             pass
         self.root.after(50, self._drain_queue)
