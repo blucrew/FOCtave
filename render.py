@@ -307,6 +307,8 @@ def render_multi(
     # First scene dictates output size
     first = _prepare_scene(Path(scenes[0]["image_path"]),
                             scenes[0]["electrodes"], max_dim)
+    first["effect_opacity"] = float(
+        scenes[0].get("overrides", {}).get("effect_opacity", effect_opacity))
     w, h = first["w"], first["h"]
 
     # Prepare every scene, forcing each to match the first scene's size so
@@ -339,6 +341,8 @@ def render_multi(
             "electrodes": fitted_elec,
             "path_xys": path_xys, "path_weights": path_weights,
             "path_t": path_t,
+            "effect_opacity": float(s.get("overrides", {}).get("effect_opacity",
+                                                               effect_opacity)),
         })
 
     # Duration
@@ -388,11 +392,8 @@ def render_multi(
     t_start = time.perf_counter()
 
     # Effect opacity scales how dominant the glow/ribbon is vs the base
-    # image. Base ribbon constant was 140 and electrode peak was 180; with
-    # default opacity 0.55 those become ~77 and ~99, so the underlying
-    # image texture ("scales") stays visible through the glow.
-    ribbon_brightness = 140.0 * effect_opacity
-    electrode_brightness_peak = 180.0 * effect_opacity
+    # image. Each prepped scene carries its own opacity (either overridden
+    # for that scene or inherited from the global `effect_opacity`).
 
     def render_scene_frame(scene, vals, t_s):
         vol = vals["volume"]
@@ -405,6 +406,9 @@ def render_multi(
         wave = 0.60 + 0.40 * np.sin(2 * np.pi * (scene["path_t"] * 2.0 - t_s * 1.2))
         path_intensity = path_intensity * wave
         ribbon_thickness = 0.55 + 0.45 * vol
+        scene_opacity = scene.get("effect_opacity", effect_opacity)
+        ribbon_brightness = 140.0 * scene_opacity
+        electrode_peak = 180.0 * scene_opacity
         draw_path_ribbon(canvas, scene["path_xys"], path_intensity, ribbon_color,
                          ribbon_stamp, ribbon_thickness,
                          brightness_scale=ribbon_brightness)
@@ -416,7 +420,7 @@ def render_multi(
             stamp_glow(canvas, cx, cy, stamp,
                        0.35 + 0.65 * intensity,
                        electrode_colors[ch],
-                       electrode_brightness_peak * intensity)
+                       electrode_peak * intensity)
         return canvas
 
     try:

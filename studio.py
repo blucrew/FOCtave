@@ -30,6 +30,30 @@ import foctave
 import render as render_mod
 
 
+# ------- Persistence: per-user config (last-used dirs + recent files) -------
+
+CONFIG_PATH = Path.home() / ".foctave_studio.json"
+
+
+def load_config() -> dict:
+    if CONFIG_PATH.exists():
+        try:
+            return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def save_config(cfg: dict) -> None:
+    try:
+        CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"Could not save {CONFIG_PATH}: {e}")
+
+
+PROJECT_VERSION = 1
+
+
 LABELS = ["e1", "e2", "e3", "e4"]
 COLORS = ["#ff4040", "#ffaa30", "#40ff60", "#40aaff"]
 MARKER_RADIUS = 12
@@ -317,14 +341,21 @@ class StudioApp:
         self.root.geometry("1500x900")
         self.root.minsize(1000, 650)
 
+        # Persistent per-user config (last dirs, recent projects)
+        self.config = load_config()
+        self.current_project_path: Path | None = None
+
         self.audio_path = tk.StringVar()
         self.output_dir = tk.StringVar()
         self.project_name = tk.StringVar(value="untitled")
         self.preset_var = tk.StringVar(value="belgium")
 
-        # Scenes: list[{"path": Path, "electrodes": dict}]
+        # Scenes: list[{"path": Path, "electrodes": dict, "overrides": {...}}]
         self.scenes: list[dict] = []
         self.active_scene_idx: int = -1
+        # Per-scene effect opacity override (mirrored for the active scene)
+        self.scene_opacity_override_enabled = tk.BooleanVar(value=False)
+        self.scene_opacity_override_value = tk.DoubleVar(value=0.55)
 
         self.tune_vars = {
             "gamma": tk.DoubleVar(value=0.30),
@@ -349,13 +380,39 @@ class StudioApp:
         self.progress_var = tk.DoubleVar(value=0.0)
         self.render_busy = False
 
+        self._build_menu()
         self._build_top()
         self._build_main()
         self._build_bottom()
         self._apply_preset()
 
+        # Keyboard shortcuts for project file actions
+        self.root.bind("<Control-n>", lambda e: self._project_new())
+        self.root.bind("<Control-o>", lambda e: self._project_open())
+        self.root.bind("<Control-s>", lambda e: self._project_save())
+        self.root.bind("<Control-Shift-s>", lambda e: self._project_save_as())
+        self.root.bind("<Control-S>", lambda e: self._project_save_as())
+
         self.ui_queue: queue.Queue = queue.Queue()
         self.root.after(50, self._drain_queue)
+
+    # --- Menu ---
+
+    def _build_menu(self):
+        menubar = tk.Menu(self.root)
+        filemenu = tk.Menu(menubar, tearoff=0)
+        filemenu.add_command(label="New project", accelerator="Ctrl+N",
+                             command=self._project_new)
+        filemenu.add_command(label="Open project…", accelerator="Ctrl+O",
+                             command=self._project_open)
+        filemenu.add_command(label="Save project", accelerator="Ctrl+S",
+                             command=self._project_save)
+        filemenu.add_command(label="Save project as…", accelerator="Ctrl+Shift+S",
+                             command=self._project_save_as)
+        filemenu.add_separator()
+        filemenu.add_command(label="Quit", command=self.root.quit)
+        menubar.add_cascade(label="File", menu=filemenu)
+        self.root.config(menu=menubar)
 
     # --- Top (file pickers) ---
 
@@ -458,6 +515,38 @@ class StudioApp:
 
         ttk.Separator(panel, orient="horizontal").pack(fill="x", pady=6, padx=8)
 
+        # Per-scene effect override
+        tk.Label(panel, text="Per-scene effect", fg="#fff", bg="#1a1a1a",
+                 font=("Arial", 10, "bold")).pack(anchor="w", padx=10)
+        tk.Label(panel, text="Override global opacity\nfor the selected scene.",
+                 fg="#888", bg="#1a1a1a", font=("Arial", 8),
+                 justify="left").pack(anchor="w", padx=10, pady=(0, 2))
+        ovr_row = tk.Frame(panel, bg="#1a1a1a")
+        ovr_row.pack(fill="x", padx=10, pady=2)
+        self._override_check = ttk.Checkbutton(
+            ovr_row, text="override",
+            variable=self.scene_opacity_override_enabled,
+            command=self._on_scene_override_change)
+        self._override_check.pack(side="left")
+        self._override_spin = ttk.Spinbox(
+            ovr_row, from_=0.0, to=1.0, increment=0.05,
+            textvariable=self.scene_opacity_override_value,
+            format="%.2f", width=6,
+            command=self._on_scene_override_change)
+        self._override_spin.pack(side="right")
+        # Also update when the spinbox loses focus or is typed into
+        self._override_spin.bind("<FocusOut>",
+                                 lambda _e: self._on_scene_override_change())
+        Tooltip(self._override_check,
+                "When checked, this specific scene uses the opacity value "
+                "on the right instead of the global effect opacity. Lets you "
+                "dial each image independently.")
+        Tooltip(self._override_spin,
+                "Effect opacity for just this scene (0-1). Only used when the "
+                "'override' checkbox is ticked.")
+
+        ttk.Separator(panel, orient="horizontal").pack(fill="x", pady=6, padx=8)
+
         # Electrodes info
         self.electrode_count_label = tk.Label(panel, text="Electrodes: 0/4",
                                               fg="#ddd", bg="#1a1a1a")
@@ -470,12 +559,20 @@ class StudioApp:
         panel.pack(side="right", fill="y")
         panel.pack_propagate(False)
 
+        def _bg(w, fallback="#1e1e1e"):
+            # ttk widgets don't expose -bg via cget; use a fallback.
+            try:
+                return w.cget("bg")
+            except tk.TclError:
+                return fallback
+
         def spin_row(parent, label, var, key, frm, to, inc, fmt="%.2f"):
             """Label + spinbox row. Attaches a tooltip based on `key`."""
-            row = tk.Frame(parent, bg=parent.cget("bg"))
+            bg = _bg(parent)
+            row = tk.Frame(parent, bg=bg)
             row.pack(fill="x", padx=10, pady=2)
             lbl = tk.Label(row, text=label, width=12, anchor="w",
-                           fg="#ddd", bg=parent.cget("bg"))
+                           fg="#ddd", bg=bg)
             lbl.pack(side="left")
             sb = ttk.Spinbox(row, from_=frm, to=to, increment=inc,
                              textvariable=var, format=fmt, width=8)
@@ -548,20 +645,35 @@ class StudioApp:
         tk.Label(bot, textvariable=self.status_var,
                  anchor="w", fg="#ddd", bg="#1e1e1e").pack(side="left", fill="x", padx=10, pady=6)
 
-    # --- File browsers ---
+    # --- File browsers (with per-dialog last-used directories) ---
+
+    def _dlg_initialdir(self, key: str) -> str | None:
+        """Return a remembered directory for a given dialog key, or None."""
+        last = self.config.get("last_dirs", {}).get(key)
+        return last if last and Path(last).is_dir() else None
+
+    def _dlg_remember(self, key: str, path: str | Path) -> None:
+        d = str(Path(path).parent if Path(path).is_file() else Path(path))
+        self.config.setdefault("last_dirs", {})[key] = d
+        save_config(self.config)
 
     def _browse_audio(self):
         p = filedialog.askopenfilename(
             title="Select audio track",
+            initialdir=self._dlg_initialdir("audio"),
             filetypes=[("Audio", "*.wav *.mp3 *.flac *.m4a *.ogg"), ("All", "*.*")])
         if p:
             self.audio_path.set(p)
+            self._dlg_remember("audio", p)
             self._autofill_output()
 
     def _browse_output(self):
-        p = filedialog.askdirectory(title="Select output folder")
+        p = filedialog.askdirectory(
+            title="Select output folder",
+            initialdir=self._dlg_initialdir("output"))
         if p:
             self.output_dir.set(p)
+            self._dlg_remember("output", p)
 
     def _autofill_output(self):
         if self.output_dir.get():
@@ -577,6 +689,7 @@ class StudioApp:
     def _add_scene(self):
         paths = filedialog.askopenfilenames(
             title="Select image(s) to add",
+            initialdir=self._dlg_initialdir("image"),
             filetypes=[("Images", "*.jpg *.jpeg *.png *.webp *.bmp"), ("All", "*.*")])
         if not paths:
             return
@@ -593,9 +706,9 @@ class StudioApp:
                             electrodes[lab] = (int(pos["x"]), int(pos["y"]))
                 except Exception:
                     pass
-            self.scenes.append({"path": pth, "electrodes": electrodes})
+            self.scenes.append({"path": pth, "electrodes": electrodes, "overrides": {}})
+        self._dlg_remember("image", paths[0])
         self._refresh_scene_list()
-        # Auto-select the first added scene if nothing was selected
         if self.active_scene_idx < 0:
             self.active_scene_idx = 0
             self._load_active_scene()
@@ -639,9 +752,42 @@ class StudioApp:
     def _load_active_scene(self):
         if self.active_scene_idx < 0 or self.active_scene_idx >= len(self.scenes):
             self.canvas_widget.set_image(None)
+            self._sync_scene_override_ui()
             return
         s = self.scenes[self.active_scene_idx]
+        # Ensure overrides dict exists (projects saved before this feature)
+        s.setdefault("overrides", {})
         self.canvas_widget.set_image(s["path"], electrodes=s["electrodes"])
+        self._sync_scene_override_ui()
+
+    def _sync_scene_override_ui(self):
+        """Reflect the active scene's overrides in the checkbox / spinbox."""
+        if 0 <= self.active_scene_idx < len(self.scenes):
+            ovr = self.scenes[self.active_scene_idx].get("overrides", {})
+            if "effect_opacity" in ovr:
+                self.scene_opacity_override_enabled.set(True)
+                self.scene_opacity_override_value.set(float(ovr["effect_opacity"]))
+            else:
+                self.scene_opacity_override_enabled.set(False)
+                # Mirror the global value as the starting point for editing
+                self.scene_opacity_override_value.set(
+                    float(self.video_vars["effect_opacity"].get()))
+        else:
+            self.scene_opacity_override_enabled.set(False)
+
+    def _on_scene_override_change(self):
+        """Called when the scene override checkbox or spinbox changes."""
+        if self.active_scene_idx < 0 or self.active_scene_idx >= len(self.scenes):
+            return
+        s = self.scenes[self.active_scene_idx]
+        s.setdefault("overrides", {})
+        if self.scene_opacity_override_enabled.get():
+            try:
+                s["overrides"]["effect_opacity"] = float(self.scene_opacity_override_value.get())
+            except (tk.TclError, ValueError):
+                pass
+        else:
+            s["overrides"].pop("effect_opacity", None)
 
     def _on_canvas_change(self):
         if 0 <= self.active_scene_idx < len(self.scenes):
@@ -710,7 +856,9 @@ class StudioApp:
         self.progress_var.set(0.0)
         self.status_var.set("Starting…")
 
-        scenes_snapshot = [{"path": Path(s["path"]), "electrodes": dict(s["electrodes"])}
+        scenes_snapshot = [{"path": Path(s["path"]),
+                            "electrodes": dict(s["electrodes"]),
+                            "overrides": dict(s.get("overrides", {}))}
                            for s in self.scenes]
 
         t = threading.Thread(
@@ -786,7 +934,9 @@ class StudioApp:
             def render_progress(frac, msg):
                 self._post_status(msg, 0.40 + frac * 0.60)
 
-            render_scenes = [{"image_path": s["path"], "electrodes": s["electrodes"]}
+            render_scenes = [{"image_path": s["path"],
+                              "electrodes": s["electrodes"],
+                              "overrides": s.get("overrides", {})}
                              for s in scenes]
 
             render_mod.render_multi(
@@ -811,6 +961,163 @@ class StudioApp:
             import traceback
             traceback.print_exc()
             self._post_status(f"Error: {e}", self.progress_var.get(), done=True)
+
+    # --- Project save / load ---
+
+    def _project_new(self):
+        if self.scenes or self.audio_path.get():
+            if not messagebox.askyesno(
+                "New project",
+                "Discard the current project and start fresh?"):
+                return
+        self.current_project_path = None
+        self.project_name.set("untitled")
+        self.audio_path.set("")
+        self.output_dir.set("")
+        self.scenes = []
+        self.active_scene_idx = -1
+        self._refresh_scene_list()
+        self.canvas_widget.set_image(None)
+        self._sync_scene_override_ui()
+        self.preset_var.set("belgium")
+        self._apply_preset()
+        # Reset video vars to their construction defaults (matching __init__)
+        self.video_vars["max_dim"].set(1280)
+        self.video_vars["fps"].set(30)
+        self.video_vars["bloom"].set(0.45)
+        self.video_vars["min_dim"].set(0.55)
+        self.video_vars["effect_opacity"].set(0.55)
+        self.scene_duration_var.set(20.0)
+        self.crossfade_enabled.set(True)
+        self.crossfade_var.set(0.5)
+        self.status_var.set("New project.")
+        self.root.title("FOCtave Studio")
+
+    def _project_open(self):
+        p = filedialog.askopenfilename(
+            title="Open FOCtave project",
+            initialdir=self._dlg_initialdir("project"),
+            filetypes=[("FOCtave project", "*.foctave.json"),
+                       ("JSON", "*.json"), ("All", "*.*")])
+        if not p:
+            return
+        try:
+            data = json.loads(Path(p).read_text(encoding="utf-8"))
+        except Exception as e:
+            messagebox.showerror("Open failed", f"Could not read project: {e}")
+            return
+        self._apply_project_data(data)
+        self.current_project_path = Path(p).resolve()
+        self._dlg_remember("project", p)
+        self.status_var.set(f"Loaded {Path(p).name}")
+        self.root.title(f"FOCtave Studio — {Path(p).name}")
+
+    def _project_save(self):
+        if self.current_project_path is None:
+            return self._project_save_as()
+        self._write_project_to(self.current_project_path)
+
+    def _project_save_as(self):
+        default_name = slug(self.project_name.get()) + ".foctave.json"
+        p = filedialog.asksaveasfilename(
+            title="Save FOCtave project",
+            initialdir=self._dlg_initialdir("project"),
+            initialfile=default_name,
+            defaultextension=".foctave.json",
+            filetypes=[("FOCtave project", "*.foctave.json"),
+                       ("JSON", "*.json"), ("All", "*.*")])
+        if not p:
+            return
+        self.current_project_path = Path(p).resolve()
+        self._dlg_remember("project", p)
+        self._write_project_to(self.current_project_path)
+
+    def _write_project_to(self, path: Path):
+        # Ensure any in-flight canvas edits are captured
+        if 0 <= self.active_scene_idx < len(self.scenes):
+            self.scenes[self.active_scene_idx]["electrodes"] = \
+                self.canvas_widget.get_electrodes()
+        data = self._collect_project_data()
+        try:
+            path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            self.status_var.set(f"Saved {path.name}")
+            self.root.title(f"FOCtave Studio — {path.name}")
+        except Exception as e:
+            messagebox.showerror("Save failed", f"Could not write project: {e}")
+
+    def _collect_project_data(self) -> dict:
+        return {
+            "version": PROJECT_VERSION,
+            "project_name": self.project_name.get(),
+            "audio_path": self.audio_path.get(),
+            "output_dir": self.output_dir.get(),
+            "preset": self.preset_var.get(),
+            "tune": {k: float(v.get()) for k, v in self.tune_vars.items()},
+            "video": {k: (int(v.get()) if isinstance(v, tk.IntVar) else float(v.get()))
+                      for k, v in self.video_vars.items()},
+            "scene_duration_s": float(self.scene_duration_var.get()),
+            "crossfade_enabled": bool(self.crossfade_enabled.get()),
+            "crossfade_s": float(self.crossfade_var.get()),
+            "scenes": [{
+                "path": str(s["path"]),
+                "electrodes": {k: {"x": v[0], "y": v[1]} for k, v in s["electrodes"].items()},
+                "overrides": dict(s.get("overrides", {})),
+            } for s in self.scenes],
+        }
+
+    def _apply_project_data(self, data: dict):
+        self.project_name.set(data.get("project_name", "untitled"))
+        self.audio_path.set(data.get("audio_path", ""))
+        self.output_dir.set(data.get("output_dir", ""))
+
+        for k, v in data.get("tune", {}).items():
+            if k in self.tune_vars:
+                try:
+                    self.tune_vars[k].set(float(v))
+                except Exception:
+                    pass
+        for k, v in data.get("video", {}).items():
+            if k in self.video_vars:
+                try:
+                    self.video_vars[k].set(v)
+                except Exception:
+                    pass
+        if "preset" in data:
+            self.preset_var.set(data["preset"])
+            # Don't re-apply preset defaults; tune values above win
+        self.scene_duration_var.set(float(data.get("scene_duration_s", 20.0)))
+        self.crossfade_enabled.set(bool(data.get("crossfade_enabled", True)))
+        self.crossfade_var.set(float(data.get("crossfade_s", 0.5)))
+
+        self.scenes = []
+        missing = []
+        for s in data.get("scenes", []):
+            path = Path(s.get("path", ""))
+            if not path.exists():
+                missing.append(str(path))
+                continue
+            electrodes = {}
+            for lab, pos in s.get("electrodes", {}).items():
+                if lab in LABELS:
+                    electrodes[lab] = (int(pos["x"]), int(pos["y"]))
+            self.scenes.append({
+                "path": path.resolve(),
+                "electrodes": electrodes,
+                "overrides": dict(s.get("overrides", {})),
+            })
+        self.active_scene_idx = 0 if self.scenes else -1
+        self._refresh_scene_list()
+        self._load_active_scene()
+
+        if missing:
+            preview = "\n".join(missing[:5])
+            more = "" if len(missing) <= 5 else f"\n...and {len(missing)-5} more"
+            messagebox.showwarning(
+                "Missing images",
+                f"{len(missing)} image(s) from this project could not be found:\n\n"
+                f"{preview}{more}")
+
+    # --- Status queue plumbing ---
 
     def _post_status(self, msg, fraction, done=False, final_folder=None):
         self.ui_queue.put((msg, fraction, done, final_folder))
