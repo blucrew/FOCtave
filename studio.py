@@ -22,7 +22,7 @@ import sys
 import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import colorchooser, filedialog, messagebox, ttk
 
 from PIL import Image, ImageTk
 
@@ -52,6 +52,48 @@ def save_config(cfg: dict) -> None:
 
 
 PROJECT_VERSION = 1
+
+
+# ------- Central image library (cross-project electrode placements) -------
+
+LIBRARY_DIR = Path.home() / ".foctave"
+LIBRARY_PATH = LIBRARY_DIR / "library.json"
+
+
+def load_library() -> dict:
+    if LIBRARY_PATH.exists():
+        try:
+            return json.loads(LIBRARY_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {"images": {}}
+
+
+def save_library(lib: dict) -> None:
+    try:
+        LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
+        LIBRARY_PATH.write_text(json.dumps(lib, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"Could not save library {LIBRARY_PATH}: {e}")
+
+
+def library_record(image_path: Path, electrodes: dict, size_wh: tuple[int, int]) -> None:
+    """Record or update an image's electrodes in the central library."""
+    from datetime import datetime
+    lib = load_library()
+    lib.setdefault("images", {})[str(image_path.resolve())] = {
+        "electrodes": {k: {"x": v[0], "y": v[1]} for k, v in electrodes.items()},
+        "image_size": {"w": size_wh[0], "h": size_wh[1]},
+        "last_used": datetime.now().isoformat(timespec="seconds"),
+    }
+    save_library(lib)
+
+
+def library_lookup(image_path: Path) -> dict | None:
+    """Return the stored entry for this image, or None."""
+    lib = load_library()
+    key = str(image_path.resolve())
+    return lib.get("images", {}).get(key)
 
 
 LABELS = ["e1", "e2", "e3", "e4"]
@@ -158,6 +200,20 @@ TOOLTIPS = {
                       "next. Ignored if only one image is in the list.",
     "crossfade": "Fade between scenes over this many seconds at each "
                  "rotation. Set to 0 (or uncheck) for hard cuts.",
+    # Effect styles
+    "effect_style_ribbon": "Diffuse glow along the whole path e1->e2->e3->e4. "
+                           "Brightness at any point = interpolation of the "
+                           "two adjacent electrode values. Default.",
+    "effect_style_lights": "One discrete bright spot per segment, its position "
+                           "set by the intensity ratio of the two endpoints "
+                           "(slides toward the hotter end).",
+    "effect_style_sparks": "Like 'lights' but with a jittered, flickering "
+                           "electric-arc feel. Good for punchy, rhythmic tracks.",
+    "ribbon_color": "Colour for the main effect (ribbon / lights / sparks). "
+                    "Electrode anchor glows keep their fixed warm/cool "
+                    "scheme so you can still read channel topology.",
+    "eyedrop": "Click this, then click anywhere on the image to sample a "
+               "pixel's colour and use it as the effect colour.",
 }
 
 
@@ -178,12 +234,23 @@ class ElectrodeCanvas(tk.Frame):
         self.img_offset_y: int = 0
         self.electrodes: dict[str, tuple[int, int]] = {}
         self.drag_target: str | None = None
+        self._eyedrop_callback = None
 
         self.canvas.bind("<Button-1>", self._on_left_click)
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
         self.canvas.bind("<Button-3>", self._on_right_click)
         self.canvas.bind("<Configure>", self._on_resize)
+
+    def begin_eyedrop(self, callback):
+        """Suspend placement mode; next left-click samples a pixel and
+        reports its colour back via `callback(hex_color_str)`."""
+        self._eyedrop_callback = callback
+        self.canvas.config(cursor="target")
+
+    def cancel_eyedrop(self):
+        self._eyedrop_callback = None
+        self.canvas.config(cursor="crosshair")
 
     def set_image(self, image_path: Path | None, electrodes: dict | None = None):
         if image_path is None:
@@ -299,6 +366,23 @@ class ElectrodeCanvas(tk.Frame):
     def _on_left_click(self, event):
         if self.image is None:
             return
+        # Eyedrop mode intercepts clicks before placement/drag.
+        if self._eyedrop_callback is not None and self._inside_image(event.x, event.y):
+            ix, iy = self._canvas_to_img(event.x, event.y)
+            try:
+                pixel = self.image.getpixel((ix, iy))
+                if isinstance(pixel, int):
+                    r = g = b = pixel
+                else:
+                    r, g, b = pixel[:3]
+                hex_color = f"#{r:02x}{g:02x}{b:02x}"
+                cb = self._eyedrop_callback
+                self._eyedrop_callback = None
+                self.canvas.config(cursor="crosshair")
+                cb(hex_color)
+            except Exception:
+                self.cancel_eyedrop()
+            return
         hit = self._find_at(event.x, event.y)
         if hit:
             self.drag_target = hit
@@ -372,6 +456,8 @@ class StudioApp:
             "min_dim": tk.DoubleVar(value=0.55),
             "effect_opacity": tk.DoubleVar(value=0.55),
         }
+        self.effect_style = tk.StringVar(value="ribbon")
+        self.ribbon_color = tk.StringVar(value="#ffb04d")  # warm amber default
         self.scene_duration_var = tk.DoubleVar(value=20.0)
         self.crossfade_var = tk.DoubleVar(value=0.5)
         self.crossfade_enabled = tk.BooleanVar(value=True)
@@ -630,6 +716,41 @@ class StudioApp:
         spin_row(card_video, "effect opacity", self.video_vars["effect_opacity"],
                  "effect_opacity", 0.0, 1.0, 0.05)
 
+        # Effect style
+        ttk.Separator(card_video, orient="horizontal").pack(fill="x", pady=6)
+        tk.Label(card_video, text="Effect style",
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(0, 2))
+        style_frame = tk.Frame(card_video)
+        style_frame.pack(anchor="w", padx=4)
+        for style_name, tip_key in [("ribbon", "effect_style_ribbon"),
+                                    ("lights", "effect_style_lights"),
+                                    ("sparks", "effect_style_sparks")]:
+            rb = ttk.Radiobutton(style_frame, text=style_name, value=style_name,
+                                 variable=self.effect_style)
+            rb.pack(anchor="w")
+            Tooltip(rb, TOOLTIPS[tip_key])
+
+        # Effect color with swatch + picker + eyedropper
+        tk.Label(card_video, text="Effect colour",
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(6, 2))
+        color_row = tk.Frame(card_video)
+        color_row.pack(fill="x", pady=2)
+        self._color_swatch = tk.Frame(color_row, bg=self.ribbon_color.get(),
+                                      width=26, height=22,
+                                      highlightthickness=1,
+                                      highlightbackground="#555")
+        self._color_swatch.pack(side="left", padx=(0, 6))
+        self._color_swatch.pack_propagate(False)
+        pick_btn = ttk.Button(color_row, text="Pick…", width=7,
+                              command=self._pick_color)
+        pick_btn.pack(side="left", padx=2)
+        eyedrop_btn = ttk.Button(color_row, text="Eyedrop", width=9,
+                                 command=self._start_eyedrop)
+        eyedrop_btn.pack(side="left", padx=2)
+        Tooltip(self._color_swatch, TOOLTIPS["ribbon_color"])
+        Tooltip(pick_btn, TOOLTIPS["ribbon_color"])
+        Tooltip(eyedrop_btn, TOOLTIPS["eyedrop"])
+
     def _build_bottom(self):
         bot = tk.Frame(self.root, bg="#1e1e1e")
         bot.pack(side="bottom", fill="x")
@@ -695,9 +816,9 @@ class StudioApp:
             return
         for p in paths:
             pth = Path(p).resolve()
-            # Library auto-load from sidecar
-            sidecar = pth.with_suffix(".electrodes.json")
             electrodes = {}
+            # 1. Prefer the sidecar right next to the image if present
+            sidecar = pth.with_suffix(".electrodes.json")
             if sidecar.exists():
                 try:
                     data = json.loads(sidecar.read_text(encoding="utf-8"))
@@ -706,6 +827,14 @@ class StudioApp:
                             electrodes[lab] = (int(pos["x"]), int(pos["y"]))
                 except Exception:
                     pass
+            # 2. Fall back to the central library (keeps placements available
+            # even if the sidecar file was deleted / the image was copied)
+            if not electrodes:
+                entry = library_lookup(pth)
+                if entry:
+                    for lab, pos in entry.get("electrodes", {}).items():
+                        if lab in LABELS:
+                            electrodes[lab] = (int(pos["x"]), int(pos["y"]))
             self.scenes.append({"path": pth, "electrodes": electrodes, "overrides": {}})
         self._dlg_remember("image", paths[0])
         self._refresh_scene_list()
@@ -867,46 +996,52 @@ class StudioApp:
                   {k: v.get() for k, v in self.tune_vars.items()},
                   {k: v.get() for k, v in self.video_vars.items()},
                   float(self.scene_duration_var.get()),
-                  float(self.crossfade_var.get()) if self.crossfade_enabled.get() else 0.0),
+                  float(self.crossfade_var.get()) if self.crossfade_enabled.get() else 0.0,
+                  self.effect_style.get(),
+                  self.ribbon_color.get()),
             daemon=True,
         )
         t.start()
 
     def _render_worker(self, name, audio, outdir, scenes, tune, video,
-                       scene_duration_s, crossfade_s):
+                       scene_duration_s, crossfade_s,
+                       effect_style, ribbon_color_hex):
         try:
             proj_dir = outdir / name
             proj_dir.mkdir(parents=True, exist_ok=True)
 
-            # 1. Save combined scenes JSON for the project + update per-image sidecars
-            combined = {"scenes": []}
+            # 1. Update per-image library sidecars only. We intentionally do
+            # NOT write a combined electrodes/scenes JSON into the output
+            # folder: that file would reference absolute paths to source
+            # images outside the package, which isn't useful as a deliverable.
+            # Project-level metadata lives in File > Save project (.foctave.json).
             for s in scenes:
                 img_path = s["path"]
                 iw, ih = Image.open(img_path).size
-                entry = {
-                    "image": str(img_path),
-                    "image_size": {"w": iw, "h": ih},
-                    "electrodes": {k: {"x": v[0], "y": v[1]} for k, v in s["electrodes"].items()},
-                }
-                combined["scenes"].append(entry)
-                # Library sidecar next to the original image
                 sidecar = img_path.with_suffix(".electrodes.json")
                 try:
                     sidecar.write_text(json.dumps({
                         "image": img_path.name,
                         "image_size": {"w": iw, "h": ih},
-                        "electrodes": entry["electrodes"],
+                        "electrodes": {k: {"x": v[0], "y": v[1]}
+                                       for k, v in s["electrodes"].items()},
                     }, indent=2), encoding="utf-8")
                 except Exception as e:
                     print(f"Warning: couldn't write library sidecar {sidecar}: {e}")
+                # Also record in the central cross-project library
+                try:
+                    library_record(img_path, s["electrodes"], (iw, ih))
+                except Exception as e:
+                    print(f"Warning: couldn't update central library: {e}")
 
-            (proj_dir / f"{name}.electrodes.json").write_text(
-                json.dumps(combined, indent=2), encoding="utf-8")
-            self._post_status("Saved scenes and library sidecars", 0.02)
+            self._post_status("Saved sidecars + library", 0.02)
 
-            # 2. Convert audio -> funscripts
+            # 2. Convert audio -> funscripts.
+            # Convert takes seconds; render takes minutes. Allocate
+            # 5% of the bar to convert and 95% to render so the bar
+            # matches actual wall time instead of jumping ahead.
             def convert_progress(frac, msg):
-                self._post_status(msg, 0.02 + frac * 0.38)
+                self._post_status(msg, 0.02 + frac * 0.03)
 
             foctave.convert(
                 input_path=audio,
@@ -932,12 +1067,21 @@ class StudioApp:
             output_mp4 = proj_dir / f"{name}.mp4"
 
             def render_progress(frac, msg):
-                self._post_status(msg, 0.40 + frac * 0.60)
+                self._post_status(msg, 0.05 + frac * 0.95)
 
             render_scenes = [{"image_path": s["path"],
                               "electrodes": s["electrodes"],
                               "overrides": s.get("overrides", {})}
                              for s in scenes]
+
+            # Convert hex color to RGB floats 0..1
+            hx = ribbon_color_hex.lstrip("#")
+            if len(hx) == 6:
+                rc = (int(hx[0:2], 16) / 255.0,
+                      int(hx[2:4], 16) / 255.0,
+                      int(hx[4:6], 16) / 255.0)
+            else:
+                rc = None
 
             render_mod.render_multi(
                 scenes=render_scenes,
@@ -952,6 +1096,8 @@ class StudioApp:
                 scene_duration_s=scene_duration_s,
                 crossfade_s=crossfade_s,
                 effect_opacity=video["effect_opacity"],
+                effect_style=effect_style,
+                ribbon_color=rc,
                 progress=render_progress,
             )
 
@@ -961,6 +1107,34 @@ class StudioApp:
             import traceback
             traceback.print_exc()
             self._post_status(f"Error: {e}", self.progress_var.get(), done=True)
+
+    # --- Color picker / eyedropper ---
+
+    def _pick_color(self):
+        current = self.ribbon_color.get()
+        rgb, hex_str = colorchooser.askcolor(
+            color=current, title="Pick effect colour")
+        if hex_str:
+            self._set_effect_color(hex_str)
+
+    def _start_eyedrop(self):
+        if not self.canvas_widget.image:
+            messagebox.showinfo("No image",
+                                "Add an image and select it before using eyedrop.")
+            return
+        self.status_var.set("Eyedrop: click any pixel on the image to sample its colour.")
+        self.canvas_widget.begin_eyedrop(self._on_eyedropped)
+
+    def _on_eyedropped(self, hex_color: str):
+        self._set_effect_color(hex_color)
+        self.status_var.set(f"Effect colour set to {hex_color}.")
+
+    def _set_effect_color(self, hex_color: str):
+        self.ribbon_color.set(hex_color)
+        try:
+            self._color_swatch.config(bg=hex_color)
+        except Exception:
+            pass
 
     # --- Project save / load ---
 
@@ -1055,6 +1229,8 @@ class StudioApp:
             "tune": {k: float(v.get()) for k, v in self.tune_vars.items()},
             "video": {k: (int(v.get()) if isinstance(v, tk.IntVar) else float(v.get()))
                       for k, v in self.video_vars.items()},
+            "effect_style": self.effect_style.get(),
+            "ribbon_color": self.ribbon_color.get(),
             "scene_duration_s": float(self.scene_duration_var.get()),
             "crossfade_enabled": bool(self.crossfade_enabled.get()),
             "crossfade_s": float(self.crossfade_var.get()),
@@ -1085,6 +1261,10 @@ class StudioApp:
         if "preset" in data:
             self.preset_var.set(data["preset"])
             # Don't re-apply preset defaults; tune values above win
+        if "effect_style" in data:
+            self.effect_style.set(data["effect_style"])
+        if "ribbon_color" in data:
+            self._set_effect_color(data["ribbon_color"])
         self.scene_duration_var.set(float(data.get("scene_duration_s", 20.0)))
         self.crossfade_enabled.set(bool(data.get("crossfade_enabled", True)))
         self.crossfade_var.set(float(data.get("crossfade_s", 0.5)))

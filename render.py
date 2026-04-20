@@ -204,6 +204,91 @@ def build_path(electrodes_ordered: list[tuple[int, int]],
     return np.array(xys).astype(np.int32), np.array(weights)
 
 
+def _stamp_at(canvas: np.ndarray, x: int, y: int, stamp: np.ndarray,
+              color: tuple[float, float, float], brightness: float) -> None:
+    """Additive-stamp a precomputed radial stamp into canvas at (x, y)."""
+    h, w = canvas.shape[:2]
+    sh = stamp.shape[0]
+    r = sh // 2
+    x0, x1 = x - r, x + r + 1
+    y0, y1 = y - r, y + r + 1
+    sx0 = max(0, -x0); sx1 = stamp.shape[1] - max(0, x1 - w)
+    sy0 = max(0, -y0); sy1 = stamp.shape[0] - max(0, y1 - h)
+    dx0 = max(0, x0); dx1 = min(w, x1)
+    dy0 = max(0, y0); dy1 = min(h, y1)
+    if dx0 >= dx1 or dy0 >= dy1:
+        return
+    patch = stamp[sy0:sy1, sx0:sx1] * brightness
+    for c in range(3):
+        canvas[dy0:dy1, dx0:dx1, c] += patch * color[c]
+
+
+def draw_segment_lights(canvas: np.ndarray, electrode_xys: list,
+                        e_values: np.ndarray, color: tuple[float, float, float],
+                        stamp: np.ndarray, brightness_scale: float = 200.0) -> list:
+    """Discrete bright spot per segment, positioned by intensity ratio of
+    its two endpoints (position = b / (a+b), so the spot slides toward the
+    hotter end). Brightness = average of the two endpoint values.
+
+    Returns the list of (x, y) spot positions so callers can stamp extras
+    (e.g. sparks layered on top)."""
+    positions = []
+    for i in range(len(electrode_xys) - 1):
+        a = float(e_values[i])
+        b = float(e_values[i + 1])
+        total = a + b
+        if total < 0.03:
+            positions.append(None)
+            continue
+        t = b / total  # 0 -> sits at endpoint a, 1 -> sits at endpoint b
+        pa = electrode_xys[i]
+        pb = electrode_xys[i + 1]
+        x = int(round(pa[0] + (pb[0] - pa[0]) * t))
+        y = int(round(pa[1] + (pb[1] - pa[1]) * t))
+        brightness = (a + b) * 0.5 * brightness_scale
+        _stamp_at(canvas, x, y, stamp, color, brightness)
+        positions.append((x, y))
+    return positions
+
+
+def draw_segment_sparks(canvas: np.ndarray, electrode_xys: list,
+                        e_values: np.ndarray, color: tuple[float, float, float],
+                        stamp: np.ndarray, t_s: float,
+                        brightness_scale: float = 200.0) -> None:
+    """Like `draw_segment_lights` but with small jitter + brightness
+    twinkle driven by time, giving a crackling electric-arc feel."""
+    import math
+    # Pseudo-random per segment, deterministic from t_s
+    for i in range(len(electrode_xys) - 1):
+        a = float(e_values[i])
+        b = float(e_values[i + 1])
+        total = a + b
+        if total < 0.03:
+            continue
+        t = b / total
+        pa = electrode_xys[i]
+        pb = electrode_xys[i + 1]
+        base_x = pa[0] + (pb[0] - pa[0]) * t
+        base_y = pa[1] + (pb[1] - pa[1]) * t
+        # Perpendicular offset vector (unit) for jitter
+        dx = pb[0] - pa[0]
+        dy = pb[1] - pa[1]
+        seg_len = max(1.0, (dx * dx + dy * dy) ** 0.5)
+        nx = -dy / seg_len
+        ny = dx / seg_len
+        # Multi-spark: 3 tiny flickers near the core position, jittered
+        for k in range(3):
+            phase = t_s * 17.0 + i * 1.37 + k * 2.11
+            jitter = (math.sin(phase) * 0.3 + math.cos(phase * 2.3 + k) * 0.7) * seg_len * 0.08
+            ox = math.cos(phase * 3.1 + i) * 4
+            oy = math.sin(phase * 3.1 + i) * 4
+            x = int(round(base_x + nx * jitter + ox))
+            y = int(round(base_y + ny * jitter + oy))
+            twinkle = 0.55 + 0.45 * math.sin(phase * 5.7 + k * 1.7)
+            bright = (a + b) * 0.5 * brightness_scale * twinkle
+            _stamp_at(canvas, x, y, stamp, color, bright)
+
+
 def draw_path_ribbon(canvas: np.ndarray, path_xys: np.ndarray,
                      path_intensities: np.ndarray, color: tuple[float, float, float],
                      stamp: np.ndarray, thickness_scale: float,
@@ -291,16 +376,23 @@ def render_multi(
     scene_duration_s: float | None = None,
     crossfade_s: float = 0.5,
     effect_opacity: float = 0.55,
+    effect_style: str = "ribbon",
+    ribbon_color: tuple[float, float, float] | None = None,
     progress=None,
 ) -> None:
     """Render a video that rotates through a list of scenes. Each scene is a
-    dict with keys 'image_path' (Path) and 'electrodes' (dict e1..e4 -> (x,y)).
+    dict with keys 'image_path' (Path) and 'electrodes' (dict e1..e4 -> (x,y))
+    and an optional 'overrides' dict.
 
-    With one scene this behaves exactly like single-image render.
-    With N scenes, the render rotates through them every `scene_duration_s`
-    seconds; if None, the total duration is divided evenly across scenes.
-    Between scenes, a `crossfade_s` crossfade blends the outgoing and
-    incoming frame."""
+    `effect_style` selects how the signal is visualised:
+      - "ribbon": diffuse glow along the whole path e1->e2->e3->e4 (default).
+      - "lights": one discrete spot per segment, positioned by the intensity
+        ratio of its endpoints (spot slides toward the hotter end).
+      - "sparks": like lights, but with jittered flickering stamps for an
+        electric-arc feel.
+
+    `ribbon_color` overrides the amber tint used for ribbon/lights/sparks
+    (RGB floats in [0,1]); pass None for the default warm amber."""
     if not scenes:
         raise ValueError("render_multi needs at least one scene")
 
@@ -371,7 +463,7 @@ def render_multi(
         "e3": (0.35, 1.00, 0.55),
         "e4": (0.30, 0.70, 1.00),
     }
-    ribbon_color = (1.0, 0.70, 0.30)
+    effect_color = ribbon_color if ribbon_color is not None else (1.0, 0.70, 0.30)
 
     # ffmpeg pipe
     cmd = [FFMPEG, "-y", "-loglevel", "error",
@@ -395,6 +487,10 @@ def render_multi(
     # image. Each prepped scene carries its own opacity (either overridden
     # for that scene or inherited from the global `effect_opacity`).
 
+    # Stamp for per-segment lights/sparks (slightly bigger than ribbon stamp
+    # so each spot has presence of its own).
+    light_stamp = precompute_glow_stamp(int(min(w, h) * 0.06))
+
     def render_scene_frame(scene, vals, t_s):
         vol = vals["volume"]
         dim_lo, dim_hi = base_dim_range
@@ -402,16 +498,31 @@ def render_multi(
         canvas = scene["base_arr"] * dim + scene["bloom_arr"] * (bloom_strength * vol)
         e_values = np.array([vals["e1"], vals["e2"], vals["e3"], vals["e4"]],
                             dtype=np.float32)
-        path_intensity = scene["path_weights"] @ e_values
-        wave = 0.60 + 0.40 * np.sin(2 * np.pi * (scene["path_t"] * 2.0 - t_s * 1.2))
-        path_intensity = path_intensity * wave
-        ribbon_thickness = 0.55 + 0.45 * vol
+
         scene_opacity = scene.get("effect_opacity", effect_opacity)
-        ribbon_brightness = 140.0 * scene_opacity
+
+        if effect_style == "lights":
+            electrode_xys = [scene["electrodes"][ch] for ch in ELECTRODE_CHANNELS]
+            draw_segment_lights(canvas, electrode_xys, e_values,
+                                effect_color, light_stamp,
+                                brightness_scale=200.0 * scene_opacity)
+        elif effect_style == "sparks":
+            electrode_xys = [scene["electrodes"][ch] for ch in ELECTRODE_CHANNELS]
+            draw_segment_sparks(canvas, electrode_xys, e_values,
+                                effect_color, light_stamp, t_s,
+                                brightness_scale=160.0 * scene_opacity)
+        else:
+            # Default: ribbon
+            path_intensity = scene["path_weights"] @ e_values
+            wave = 0.60 + 0.40 * np.sin(2 * np.pi * (scene["path_t"] * 2.0 - t_s * 1.2))
+            path_intensity = path_intensity * wave
+            ribbon_thickness = 0.55 + 0.45 * vol
+            draw_path_ribbon(canvas, scene["path_xys"], path_intensity, effect_color,
+                             ribbon_stamp, ribbon_thickness,
+                             brightness_scale=140.0 * scene_opacity)
+
+        # Anchor electrode glows on top (all styles)
         electrode_peak = 180.0 * scene_opacity
-        draw_path_ribbon(canvas, scene["path_xys"], path_intensity, ribbon_color,
-                         ribbon_stamp, ribbon_thickness,
-                         brightness_scale=ribbon_brightness)
         for ch in ELECTRODE_CHANNELS:
             intensity = vals[ch]
             if intensity <= 0.02:
@@ -491,6 +602,8 @@ def render(
     bloom_strength: float,
     base_dim_range: tuple[float, float],
     effect_opacity: float = 0.55,
+    effect_style: str = "ribbon",
+    ribbon_color: tuple[float, float, float] | None = None,
     progress=None,
 ) -> None:
     """Single-image convenience wrapper around render_multi."""
@@ -505,6 +618,8 @@ def render(
         bloom_strength=bloom_strength,
         base_dim_range=base_dim_range,
         effect_opacity=effect_opacity,
+        effect_style=effect_style,
+        ribbon_color=ribbon_color,
         progress=progress,
     )
 
