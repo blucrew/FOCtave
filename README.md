@@ -57,22 +57,23 @@ produce a close match to established stereo-to-4-phase conversion styles.
 
 ## Presets
 
-Four built-in presets cover the common use cases. Pick with `--preset`;
-defaults to `belgium`.
+Four built-in presets cover the common use cases, named after potato
+products — **the softer the potato, the softer the feel**. Pick with
+`--preset`; defaults to `french_fries`.
 
 ```bash
-python foctave.py input.wav                        # belgium (default)
-python foctave.py input.wav --preset comfort
-python foctave.py input.wav --preset dynamic
-python foctave.py input.wav --preset endurance
+python foctave.py input.wav                        # french_fries (default)
+python foctave.py input.wav --preset baked
+python foctave.py input.wav --preset roasted
+python foctave.py input.wav --preset mashed
 ```
 
 | Preset | gamma | percentile | attack / release | floor | vol ramp | Feel |
 |---|---:|---:|---:|---:|---:|---|
-| `belgium` | 0.30 | 75 | - | - | - | Faithful FunBelgium-style punch; e-channels pegged at 90-100 for ~60% of the track. |
-| `comfort` | 0.40 | 85 | 15 / 120 ms | 0.05 | - | Less saturated, musical transients, quiet sections never hit zero. Gentle. |
-| `dynamic` | 0.50 | 95 | 10 / 80 ms | 0.03 | - | Closer to the source audio's actual loudness curve — loud stays loud, quiet stays quiet. |
-| `endurance` | 0.35 | 80 | 20 / 150 ms | 0.08 | 0.5 %/min | Moderate baseline + gradual ramp-up over time. Designed for long tracks. |
+| `french_fries` | 0.30 | 75 | - | - | - | Crispy and sharp. Faithful FunBelgium-style punch; e-channels pegged at 90-100 for ~60% of the track. |
+| `baked` | 0.50 | 95 | 10 / 80 ms | 0.03 | - | Firm outside, soft inside. Closer to the audio's actual loudness curve — loud stays loud, quiet stays quiet. |
+| `roasted` | 0.35 | 80 | 20 / 150 ms | 0.08 | 0.5 %/min | Low-and-slow. Moderate baseline + gradual ramp-up over time. Designed for long tracks. |
+| `mashed` | 0.40 | 85 | 15 / 120 ms | 0.05 | - | Softest. Less saturated, musical transients, quiet sections never hit zero. |
 
 ### Individual tuning knobs
 
@@ -89,10 +90,10 @@ Any of these flags override the active preset:
 | `--floor` | Minimum intensity 0-1. Prevents "did it disconnect?" moments. |
 | `--volume-ramp` | Additive ramp on the volume channel in %/minute. |
 
-Example - start from `comfort` but crank saturation:
+Example - start from `mashed` but crank saturation:
 
 ```bash
-python foctave.py input.wav --preset comfort --gamma 0.30 --percentile 75
+python foctave.py input.wav --preset mashed --gamma 0.30 --percentile 75
 ```
 
 ---
@@ -106,24 +107,6 @@ FOCtave writes the minimal funscript JSON used by restim's auto-detect:
 ```
 
 `pos` is `0-100` intensity; `at` is milliseconds from start.
-
----
-
-## Using `convert()` as a library
-
-`foctave.convert()` can be called directly from other Python tools:
-
-```python
-from foctave import convert
-convert(input_path, out_dir, rate, smooth, percentile, gamma,
-        attack_ms, release_ms, floor, volume_ramp,
-        output_stem="custom_name",            # override output filename stem
-        progress=lambda f, msg: print(f, msg) # receive progress callbacks
-       )
-```
-
-`output_stem` and `progress` are extension points used by downstream tooling
-that wraps the converter in a GUI or pipeline.
 
 ---
 

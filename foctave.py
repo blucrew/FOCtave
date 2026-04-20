@@ -131,27 +131,18 @@ def write_funscript_minimal(path: Path, values_0_1: np.ndarray, out_rate_hz: flo
 
 def convert(input_path: Path, out_dir: Path, out_rate_hz: float, smooth_hz: float,
             percentile: float, gamma: float, attack_ms: float, release_ms: float,
-            floor: float, volume_ramp_pct_per_min: float,
-            output_stem: str | None = None,
-            progress=None) -> None:
+            floor: float, volume_ramp_pct_per_min: float) -> None:
     """Convert a stereo audio file into FOCtave-style 4-phase funscripts.
 
-    `output_stem` overrides the filename stem used for outputs (defaults to
-    input_path.stem). `progress` is an optional callable(fraction: float in
-    [0,1], message: str) invoked at key steps.
+    Outputs are written to `out_dir` with filenames based on `input_path.stem`.
     """
-    def _p(f, msg):
-        if progress is not None:
-            progress(f, msg)
-        print(msg)
-
-    _p(0.05, f"Loading {input_path.name}...")
+    print(f"Loading {input_path.name}...")
     stereo, sr = load_audio(input_path)
-    _p(0.15, f"  {len(stereo)/sr:.1f}s @ {sr} Hz")
+    print(f"  {len(stereo)/sr:.1f}s @ {sr} Hz")
 
     L, R = stereo[:, 0], stereo[:, 1]
 
-    _p(0.25, f"Extracting envelopes (smoothed at {smooth_hz} Hz)...")
+    print(f"Extracting envelopes (smoothed at {smooth_hz} Hz)...")
     L_env = envelope(L, sr, smooth_hz)
     R_env = envelope(R, sr, smooth_hz)
     V_env = envelope(np.sqrt(L * L + R * R), sr, smooth_hz)
@@ -159,13 +150,13 @@ def convert(input_path: Path, out_dir: Path, out_rate_hz: float, smooth_hz: floa
     step = int(round(sr / out_rate_hz))
     L_ds, R_ds, V_ds = L_env[::step], R_env[::step], V_env[::step]
 
-    _p(0.55, f"Compressing (gamma={gamma}) and normalizing (percentile={percentile})...")
+    print(f"Compressing (gamma={gamma}) and normalizing (percentile={percentile})...")
     L_n = normalize(compress_curve(L_ds, gamma), percentile)
     R_n = normalize(compress_curve(R_ds, gamma), percentile)
     V_n = normalize(V_ds, 99.5)
 
     if attack_ms > 0 or release_ms > 0:
-        _p(0.70, f"Attack/release smoothing ({attack_ms}/{release_ms} ms)...")
+        print(f"Attack/release smoothing ({attack_ms}/{release_ms} ms)...")
         L_n = asymmetric_smooth(L_n, out_rate_hz, attack_ms, release_ms)
         R_n = asymmetric_smooth(R_n, out_rate_hz, attack_ms, release_ms)
 
@@ -176,52 +167,56 @@ def convert(input_path: Path, out_dir: Path, out_rate_hz: float, smooth_hz: floa
     if volume_ramp_pct_per_min > 0:
         V_n = apply_ramp(V_n, out_rate_hz, volume_ramp_pct_per_min)
 
-    stem = output_stem or input_path.stem
+    stem = input_path.stem
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    _p(0.85, "Writing funscripts...")
+    print("Writing funscripts...")
     for name in ("e1", "e2"):
         write_funscript_minimal(out_dir / f"{stem}.{name}.funscript", L_n, out_rate_hz)
     for name in ("e3", "e4"):
         write_funscript_minimal(out_dir / f"{stem}.{name}.funscript", R_n, out_rate_hz)
     write_funscript_minimal(out_dir / f"{stem}.volume.funscript", V_n, out_rate_hz)
 
-    _p(1.0, f"Wrote {stem}.{{e1..e4, volume}}.funscript to {out_dir}")
+    print(f"Wrote {stem}.{{e1..e4, volume}}.funscript to {out_dir}")
 
 
+# Presets are named after potato products — the softer the potato, the softer
+# the preset. `french_fries` is crispy and punchy; `mashed` is the gentlest.
 PRESETS = {
-    # Faithful match to FunBelgium-style stereo-to-4-phase output:
-    # heavy saturation (pegged at 90-100 for ~60% of the time), no floor,
-    # no smoothing shaping, no auto ramp. This is the default.
-    "belgium": {
+    # Crispy, sharp, heavily saturated — faithful match to FunBelgium-style
+    # stereo-to-4-phase output: pegged at 90-100 for ~60% of the time, no
+    # floor, no smoothing shaping, no auto ramp. This is the default.
+    "french_fries": {
         "gamma": 0.30, "percentile": 75.0,
         "attack_ms": 0.0, "release_ms": 0.0,
         "floor": 0.0, "volume_ramp": 0.0,
     },
     # Gentle: less compression, asymmetric smoothing for musical transients,
-    # small floor so quiet passages don't drop to zero. Good for easy-on
-    # sessions or first-time use with new electrode placement.
-    "comfort": {
-        "gamma": 0.40, "percentile": 85.0,
-        "attack_ms": 15.0, "release_ms": 120.0,
-        "floor": 0.05, "volume_ramp": 0.0,
-    },
-    # Dynamic: closer to the audio's actual loudness curve. Peak
-    # normalization with sqrt compression lets the track breathe - loud
-    # parts feel loud, quiet parts feel quiet. More faithful to the
-    # source material's arc.
-    "dynamic": {
+    # Firm on the outside, soft in the middle: peak-normalised with sqrt
+    # compression lets the track breathe — loud parts feel loud, quiet
+    # parts feel quiet. Closer to the source audio's actual loudness arc.
+    "baked": {
         "gamma": 0.50, "percentile": 95.0,
         "attack_ms": 10.0, "release_ms": 80.0,
         "floor": 0.03, "volume_ramp": 0.0,
     },
-    # Long-session: moderate punch baseline + slow attack/release +
+    # Low-and-slow: moderate punch baseline + slow attack/release +
     # comfort floor + 0.5%/min volume ramp (restim wiki recommendation),
     # so intensity builds naturally over the course of a long track.
-    "endurance": {
+    # Named for the long cook time — designed for endurance sessions.
+    "roasted": {
         "gamma": 0.35, "percentile": 80.0,
         "attack_ms": 20.0, "release_ms": 150.0,
         "floor": 0.08, "volume_ramp": 0.5,
+    },
+    # Softest: less compression, asymmetric smoothing for musical
+    # transients, small floor so quiet passages don't drop to zero.
+    # Good for easy-on sessions or first-time use with new electrode
+    # placement.
+    "mashed": {
+        "gamma": 0.40, "percentile": 85.0,
+        "attack_ms": 15.0, "release_ms": 120.0,
+        "floor": 0.05, "volume_ramp": 0.0,
     },
 }
 
@@ -230,17 +225,20 @@ def main() -> int:
     # Two-pass parsing: grab --preset first so its values can serve as
     # defaults for the main parser (with explicit flags still winning).
     pre = argparse.ArgumentParser(add_help=False)
-    pre.add_argument("--preset", choices=list(PRESETS), default="belgium")
+    pre.add_argument("--preset", choices=list(PRESETS), default="french_fries")
     preset_args, _ = pre.parse_known_args()
     preset = PRESETS[preset_args.preset]
 
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input", type=Path)
     ap.add_argument("--out-dir", type=Path, default=None)
-    ap.add_argument("--preset", choices=list(PRESETS), default="belgium",
-                    help="Tuning preset: belgium (faithful match, default), "
-                         "comfort (gentle), dynamic (more faithful to audio), "
-                         "endurance (long-session with auto ramp). "
+    ap.add_argument("--preset", choices=list(PRESETS), default="french_fries",
+                    help="Tuning preset (named after potatoes — the softer "
+                         "the potato, the softer the feel): "
+                         "french_fries (crispy, faithful FunBelgium match, default), "
+                         "baked (firm outside, soft inside, natural loudness), "
+                         "roasted (low-and-slow, long-session with auto ramp), "
+                         "mashed (gentle, smooth, easy-on). "
                          "Individual flags below override the preset's values.")
     ap.add_argument("--rate", type=float, default=30.0,
                     help="Funscript sample rate in Hz (default 30)")
