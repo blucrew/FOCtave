@@ -27,40 +27,13 @@ routing.
 
 ```bash
 pip install -r requirements.txt
-```
-
-### All-in-one (GUI)
-
-```bash
-python studio.py
-```
-
-Opens FOCtave Studio - pick an audio file, pick an image, place four
-electrodes, choose a preset (and tweak knobs if you want), hit **Render**.
-Everything lands in `<output>/<project_name>/`:
-
-```
-my_project/
-    my_project.e1.funscript
-    my_project.e2.funscript
-    my_project.e3.funscript
-    my_project.e4.funscript
-    my_project.volume.funscript
-    my_project.electrodes.json
-    my_project.mp4
-```
-
-### Or just the funscripts (CLI)
-
-```bash
 python foctave.py path/to/your_track.wav
 ```
 
 Five `.funscript` files appear next to the audio, and restim will
 auto-detect them when you point it at the matching media file.
 
-MP3 / M4A / OGG inputs work if `ffmpeg` is on your `PATH` (Studio uses a
-bundled copy via imageio-ffmpeg, so you don't need a system install).
+MP3 / M4A / OGG inputs work if `ffmpeg` is on your `PATH`.
 
 ---
 
@@ -136,96 +109,21 @@ FOCtave writes the minimal funscript JSON used by restim's auto-detect:
 
 ---
 
-## Video pipeline (optional)
+## Using `convert()` as a library
 
-restim drives its timeline from a media file playing in MPC-HC. You can
-point it at the source audio, but staring at a blank player is no fun -
-so FOCtave ships two extra tools to generate a visualisation video that
-plays in sync, with animated electrode glows showing exactly where
-current is flowing at any moment.
+`foctave.convert()` can be called directly from other Python tools:
 
-### 1. Place electrode positions onto your still (GUI)
-
-```bash
-python place.py                          # launch with no image loaded
-python place.py path/to/your_still.jpg   # open an image at launch
+```python
+from foctave import convert
+convert(input_path, out_dir, rate, smooth, percentile, gamma,
+        attack_ms, release_ms, floor, volume_ramp,
+        output_stem="custom_name",            # override output filename stem
+        progress=lambda f, msg: print(f, msg) # receive progress callbacks
+       )
 ```
 
-A GUI opens with your image. Interactions:
-
-- **Left-click** empty space to place the next electrode (e1 -> e4 in order)
-- **Left-click + drag** a placed electrode to reposition it
-- **Right-click** an electrode to delete it
-- **File > Save** (or press `S`) writes `<image>.electrodes.json`
-- **File > Open** (or `O`) loads a different image; any existing
-  `.electrodes.json` for that image is auto-loaded so you can fine-tune
-  a previous placement
-- **File > Reset** (or `R`) clears all placed electrodes
-
-The status bar shows live image-space coordinates and placement count, and
-a faint dashed preview of the e1-e4 ribbon path is drawn between placed
-electrodes so you can see what the render will follow.
-
-### 2. Render the video
-
-```bash
-python render.py path/to/your_still.jpg
-```
-
-Picks up the funscripts and audio from the same directory automatically.
-Writes `your_still.mp4` alongside. Load that into MPC-HC instead of the
-raw audio and restim will time against it the same way.
-
-**What you get per frame:**
-
-- Base image, brightness breathing with the volume channel
-- Pre-blurred bloom layer that pulses along with volume (the image itself
-  glows when the action peaks)
-- Four radial glows at the clicked electrode positions - radius and
-  brightness driven by e1, e2, e3, e4 values
-- A flowing ribbon along the polyline e1 -> e2 -> e3 -> e4. The ribbon's
-  brightness at every point is the weighted average of the two nearest
-  electrode values, so a point midway between e2 and e3 literally feels
-  like `0.5 * e2 + 0.5 * e3`. A traveling-wave modulation makes the
-  signal visibly flow along the line instead of sitting static.
-
-The ribbon metaphor matches how longitudinal e-stim electrode placements
-actually feel - "snake head, necktie, snake belly, snake tail" - where
-sensation lives in the tissue *between* the electrodes, not just at them.
-
-### Example frames
-
-From a 12-second synthetic demo (see `examples/demo/`):
-
-| t = 2 s | t = 5 s | t = 11 s |
-|---|---|---|
-| ![low volume](examples/demo/frame_02s.png) | ![mid volume, gap between pairs](examples/demo/frame_05s.png) | ![late, bloom spread](examples/demo/frame_11s.png) |
-| e1/e2 pair throbbing, e3/e4 faint - you can see all four electrodes' assigned colors | e2/e3 both low mid-track, so the ribbon goes dark between them - the gap IS the data | Volume ramp has peaked; bloom spreads warm light into the base image |
-
-Reproduce locally with:
-
-```bash
-python render.py examples/demo/demo.jpg --max-dim 960 --bloom 0.6 --min-dim 0.65
-```
-
-### Useful flags
-
-```bash
-# Preview the first 10 seconds
-python render.py image.jpg --duration 10
-
-# Higher resolution (slower)
-python render.py image.jpg --max-dim 1920
-
-# Less bloom / dimmer base
-python render.py image.jpg --bloom 0.25 --min-dim 0.75
-```
-
-### Performance
-
-MVP render speed is roughly real-time on 1280x720 (a 30-minute track
-takes ~30 minutes to render). Use `--duration` for quick previews while
-you iterate on electrode placement or tuning.
+`output_stem` and `progress` are extension points used by downstream tooling
+that wraps the converter in a GUI or pipeline.
 
 ---
 

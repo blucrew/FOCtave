@@ -1,6 +1,3 @@
 numpy
 scipy
 soundfile
-# Video pipeline (place.py + render.py)
-pillow
-imageio-ffmpeg
