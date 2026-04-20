@@ -206,18 +206,20 @@ def build_path(electrodes_ordered: list[tuple[int, int]],
 
 def draw_path_ribbon(canvas: np.ndarray, path_xys: np.ndarray,
                      path_intensities: np.ndarray, color: tuple[float, float, float],
-                     stamp: np.ndarray, thickness_scale: float) -> None:
+                     stamp: np.ndarray, thickness_scale: float,
+                     brightness_scale: float = 140.0) -> None:
     """Stamp a small radial glow at each path point with brightness scaled
     by that point's local intensity. Overlapping stamps add up, yielding a
     continuous ribbon whose per-pixel brightness matches the interpolated
-    electrode values."""
+    electrode values. `brightness_scale` controls peak additive brightness
+    per fully-lit path point."""
     h, w = canvas.shape[:2]
     sh = stamp.shape[0]
     r_src = sh // 2
 
     r_eff = max(2, int(r_src * thickness_scale))
     idx = np.linspace(0, sh - 1, r_eff * 2 + 1).astype(np.int32)
-    stamp_small = stamp[idx][:, idx]  # resampled stamp (2r+1, 2r+1)
+    stamp_small = stamp[idx][:, idx]
     r = r_eff
 
     for (x, y), intensity in zip(path_xys, path_intensities):
@@ -232,7 +234,7 @@ def draw_path_ribbon(canvas: np.ndarray, path_xys: np.ndarray,
         dy0 = max(0, y0); dy1 = min(h, y1)
         if dx0 >= dx1 or dy0 >= dy1:
             continue
-        patch = stamp_small[sy0:sy1, sx0:sx1] * (intensity * 140.0)
+        patch = stamp_small[sy0:sy1, sx0:sx1] * (intensity * brightness_scale)
         for c in range(3):
             canvas[dy0:dy1, dx0:dx1, c] += patch * color[c]
 
@@ -288,6 +290,7 @@ def render_multi(
     base_dim_range: tuple[float, float],
     scene_duration_s: float | None = None,
     crossfade_s: float = 0.5,
+    effect_opacity: float = 0.55,
     progress=None,
 ) -> None:
     """Render a video that rotates through a list of scenes. Each scene is a
@@ -384,6 +387,13 @@ def render_multi(
     import time
     t_start = time.perf_counter()
 
+    # Effect opacity scales how dominant the glow/ribbon is vs the base
+    # image. Base ribbon constant was 140 and electrode peak was 180; with
+    # default opacity 0.55 those become ~77 and ~99, so the underlying
+    # image texture ("scales") stays visible through the glow.
+    ribbon_brightness = 140.0 * effect_opacity
+    electrode_brightness_peak = 180.0 * effect_opacity
+
     def render_scene_frame(scene, vals, t_s):
         vol = vals["volume"]
         dim_lo, dim_hi = base_dim_range
@@ -396,7 +406,8 @@ def render_multi(
         path_intensity = path_intensity * wave
         ribbon_thickness = 0.55 + 0.45 * vol
         draw_path_ribbon(canvas, scene["path_xys"], path_intensity, ribbon_color,
-                         ribbon_stamp, ribbon_thickness)
+                         ribbon_stamp, ribbon_thickness,
+                         brightness_scale=ribbon_brightness)
         for ch in ELECTRODE_CHANNELS:
             intensity = vals[ch]
             if intensity <= 0.02:
@@ -404,7 +415,8 @@ def render_multi(
             cx, cy = scene["electrodes"][ch]
             stamp_glow(canvas, cx, cy, stamp,
                        0.35 + 0.65 * intensity,
-                       electrode_colors[ch], 180 * intensity)
+                       electrode_colors[ch],
+                       electrode_brightness_peak * intensity)
         return canvas
 
     try:
@@ -474,6 +486,7 @@ def render(
     duration_s: float | None,
     bloom_strength: float,
     base_dim_range: tuple[float, float],
+    effect_opacity: float = 0.55,
     progress=None,
 ) -> None:
     """Single-image convenience wrapper around render_multi."""
@@ -487,6 +500,7 @@ def render(
         duration_s=duration_s,
         bloom_strength=bloom_strength,
         base_dim_range=base_dim_range,
+        effect_opacity=effect_opacity,
         progress=progress,
     )
 

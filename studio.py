@@ -42,6 +42,101 @@ def slug(name: str) -> str:
     return s.strip("_") or "project"
 
 
+class Tooltip:
+    """Lightweight hover-tooltip that attaches to any widget."""
+    def __init__(self, widget, text: str, delay_ms: int = 350):
+        self.widget = widget
+        self.text = text
+        self.delay_ms = delay_ms
+        self._after_id = None
+        self._tip = None
+        widget.bind("<Enter>", self._on_enter, add="+")
+        widget.bind("<Leave>", self._on_leave, add="+")
+        widget.bind("<ButtonPress>", self._on_leave, add="+")
+
+    def _on_enter(self, _e):
+        self._cancel()
+        self._after_id = self.widget.after(self.delay_ms, self._show)
+
+    def _on_leave(self, _e):
+        self._cancel()
+        self._hide()
+
+    def _cancel(self):
+        if self._after_id is not None:
+            try:
+                self.widget.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+
+    def _show(self):
+        if self._tip is not None or not self.widget.winfo_exists():
+            return
+        x = self.widget.winfo_rootx() + 18
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self._tip = tk.Toplevel(self.widget)
+        self._tip.wm_overrideredirect(True)
+        self._tip.wm_geometry(f"+{x}+{y}")
+        self._tip.configure(bg="#000")
+        tk.Label(self._tip, text=self.text, bg="#222", fg="#eee",
+                 relief="solid", borderwidth=1, padx=8, pady=4,
+                 font=("Segoe UI", 9), justify="left",
+                 wraplength=320).pack()
+
+    def _hide(self):
+        if self._tip is not None:
+            try:
+                self._tip.destroy()
+            except Exception:
+                pass
+            self._tip = None
+
+
+TOOLTIPS = {
+    # Tuning
+    "gamma": "Audio-envelope compression curve. Lower = punchier (more time "
+             "pegged at peak). Higher = more dynamic (more time mid-level). "
+             "0.30 matches FunBelgium-style saturation; 0.50 ≈ sqrt; 1.0 ≈ linear.",
+    "percentile": "Normalization reference point. Lower = more saturation "
+                  "(peaks clip to 100 sooner). 75 matches FunBelgium; "
+                  "100 = peak-faithful. Use 95+ for dynamic preset.",
+    "attack_ms": "How fast the envelope rises on a new transient. "
+                 "0 = instant (symmetric smoothing). Try 10-30 ms for a "
+                 "musical, punchy feel that still catches beats.",
+    "release_ms": "How slowly the envelope decays after a peak. "
+                  "0 = instant. Try 80-200 ms for a smoother, less choppy "
+                  "feel that lets sustained passages breathe.",
+    "floor": "Minimum intensity (0-1). 0.05 = never below 5%. Prevents "
+             "quiet moments from dropping to zero, which can feel like "
+             "'did the connection disconnect?'",
+    "volume_ramp": "Add N %/minute linearly to the volume channel. 0.5 "
+                   "matches the restim wiki's long-session recommendation. "
+                   "Intensity builds gradually over time.",
+    # Video
+    "max_dim": "Largest side of the output video in pixels. Larger = higher "
+               "quality but slower render. 720 is fast, 1280 balanced, "
+               "1920+ is high quality.",
+    "fps": "Frames per second. 30 is standard and fine for e-stim. "
+           "24 gives a film feel; 60 is smoother but doubles render time.",
+    "bloom": "Strength of the volume-driven base-image glow (0-1). The "
+             "whole image brightens in sync with the volume envelope. "
+             "0 = no bloom, 0.5 = moderate, 1 = strong.",
+    "min_dim": "Base image brightness when audio is silent (0-1). "
+               "1 = image always at full brightness; 0.5 = dims to half "
+               "during quiet passages for more contrast.",
+    "effect_opacity": "How opaque the electrode glow and ribbon are vs the "
+                      "base image (0-1). Lower = base image 'scales' shine "
+                      "through the glow. 0.55 is a balanced default; 0.3 "
+                      "= subtle accent; 1.0 = full old behaviour.",
+    # Scenes
+    "scene_duration": "Seconds each image is shown before rotating to the "
+                      "next. Ignored if only one image is in the list.",
+    "crossfade": "Fade between scenes over this many seconds at each "
+                 "rotation. Set to 0 (or uncheck) for hard cuts.",
+}
+
+
 class ElectrodeCanvas(tk.Frame):
     """Reusable canvas widget for placing e1..e4 on an image."""
 
@@ -244,6 +339,7 @@ class StudioApp:
             "fps": tk.IntVar(value=30),
             "bloom": tk.DoubleVar(value=0.45),
             "min_dim": tk.DoubleVar(value=0.55),
+            "effect_opacity": tk.DoubleVar(value=0.55),
         }
         self.scene_duration_var = tk.DoubleVar(value=20.0)
         self.crossfade_var = tk.DoubleVar(value=0.5)
@@ -341,18 +437,24 @@ class StudioApp:
         row.pack(fill="x", padx=10, pady=2)
         tk.Label(row, text="every", width=6, anchor="w",
                  fg="#ddd", bg="#1a1a1a").pack(side="left")
-        ttk.Spinbox(row, from_=1.0, to=600.0, increment=1.0,
-                    textvariable=self.scene_duration_var,
-                    format="%.1f", width=7).pack(side="left")
+        sd_spin = ttk.Spinbox(row, from_=1.0, to=600.0, increment=1.0,
+                              textvariable=self.scene_duration_var,
+                              format="%.1f", width=7)
+        sd_spin.pack(side="left")
         tk.Label(row, text="sec", fg="#ddd", bg="#1a1a1a").pack(side="left", padx=4)
+        Tooltip(sd_spin, TOOLTIPS["scene_duration"])
 
         row2 = tk.Frame(panel, bg="#1a1a1a")
         row2.pack(fill="x", padx=10, pady=2)
-        ttk.Checkbutton(row2, text="crossfade",
-                        variable=self.crossfade_enabled).pack(side="left")
-        ttk.Spinbox(row2, from_=0.0, to=3.0, increment=0.1,
-                    textvariable=self.crossfade_var,
-                    format="%.1f", width=6).pack(side="right")
+        cf_check = ttk.Checkbutton(row2, text="crossfade",
+                                    variable=self.crossfade_enabled)
+        cf_check.pack(side="left")
+        cf_spin = ttk.Spinbox(row2, from_=0.0, to=3.0, increment=0.1,
+                               textvariable=self.crossfade_var,
+                               format="%.1f", width=6)
+        cf_spin.pack(side="right")
+        Tooltip(cf_check, TOOLTIPS["crossfade"])
+        Tooltip(cf_spin, TOOLTIPS["crossfade"])
 
         ttk.Separator(panel, orient="horizontal").pack(fill="x", pady=6, padx=8)
 
@@ -364,46 +466,72 @@ class StudioApp:
                    command=self._reset_electrodes).pack(fill="x", padx=10, pady=(2, 10))
 
     def _build_controls_panel(self, parent):
-        panel = tk.Frame(parent, bg="#1e1e1e", width=320)
+        panel = tk.Frame(parent, bg="#1e1e1e", width=340)
         panel.pack(side="right", fill="y")
         panel.pack_propagate(False)
 
-        # Preset
-        tk.Label(panel, text="Preset", fg="#fff", bg="#1e1e1e",
-                 font=("Arial", 11, "bold")).pack(anchor="w", padx=10, pady=(10, 2))
+        def spin_row(parent, label, var, key, frm, to, inc, fmt="%.2f"):
+            """Label + spinbox row. Attaches a tooltip based on `key`."""
+            row = tk.Frame(parent, bg=parent.cget("bg"))
+            row.pack(fill="x", padx=10, pady=2)
+            lbl = tk.Label(row, text=label, width=12, anchor="w",
+                           fg="#ddd", bg=parent.cget("bg"))
+            lbl.pack(side="left")
+            sb = ttk.Spinbox(row, from_=frm, to=to, increment=inc,
+                             textvariable=var, format=fmt, width=8)
+            sb.pack(side="right")
+            if key in TOOLTIPS:
+                Tooltip(lbl, TOOLTIPS[key])
+                Tooltip(sb, TOOLTIPS[key])
+
+        # ---- Card 1: Audio / signal processing ----
+        card_tuning = ttk.LabelFrame(panel, text=" Signal processing ",
+                                     padding=(6, 6))
+        card_tuning.pack(fill="x", padx=8, pady=(10, 6))
+
+        # Preset subsection
+        tk.Label(card_tuning, text="Preset",
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(0, 2))
+        preset_frame = tk.Frame(card_tuning)
+        preset_frame.pack(anchor="w", padx=4)
         for name in PRESETS.keys():
-            ttk.Radiobutton(panel, text=name, value=name,
-                            variable=self.preset_var,
-                            command=self._apply_preset).pack(anchor="w", padx=20)
+            rb = ttk.Radiobutton(preset_frame, text=name, value=name,
+                                 variable=self.preset_var,
+                                 command=self._apply_preset)
+            rb.pack(anchor="w")
 
-        ttk.Separator(panel, orient="horizontal").pack(fill="x", pady=8, padx=10)
+        # Tuning subsection
+        ttk.Separator(card_tuning, orient="horizontal").pack(fill="x", pady=6)
+        tk.Label(card_tuning, text="Tuning",
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(0, 2))
+        spin_row(card_tuning, "gamma", self.tune_vars["gamma"], "gamma",
+                 0.1, 1.0, 0.05)
+        spin_row(card_tuning, "percentile", self.tune_vars["percentile"],
+                 "percentile", 50.0, 100.0, 1.0, "%.0f")
+        spin_row(card_tuning, "attack ms", self.tune_vars["attack_ms"],
+                 "attack_ms", 0.0, 200.0, 5.0, "%.0f")
+        spin_row(card_tuning, "release ms", self.tune_vars["release_ms"],
+                 "release_ms", 0.0, 500.0, 10.0, "%.0f")
+        spin_row(card_tuning, "floor", self.tune_vars["floor"], "floor",
+                 0.0, 0.30, 0.01)
+        spin_row(card_tuning, "vol ramp %/min", self.tune_vars["volume_ramp"],
+                 "volume_ramp", 0.0, 2.0, 0.1, "%.1f")
 
-        tk.Label(panel, text="Tuning", fg="#fff", bg="#1e1e1e",
-                 font=("Arial", 11, "bold")).pack(anchor="w", padx=10)
+        # ---- Card 2: Video render ----
+        card_video = ttk.LabelFrame(panel, text=" Video render ",
+                                    padding=(6, 6))
+        card_video.pack(fill="x", padx=8, pady=6)
 
-        def tune_row(parent, label, var, frm, to, inc, fmt="%.2f"):
-            f = tk.Frame(parent, bg="#1e1e1e")
-            f.pack(fill="x", padx=10, pady=2)
-            tk.Label(f, text=label, width=12, anchor="w",
-                     fg="#ddd", bg="#1e1e1e").pack(side="left")
-            ttk.Spinbox(f, from_=frm, to=to, increment=inc,
-                        textvariable=var, format=fmt, width=8).pack(side="right")
-
-        tune_row(panel, "gamma", self.tune_vars["gamma"], 0.1, 1.0, 0.05)
-        tune_row(panel, "percentile", self.tune_vars["percentile"], 50.0, 100.0, 1.0, "%.0f")
-        tune_row(panel, "attack ms", self.tune_vars["attack_ms"], 0.0, 200.0, 5.0, "%.0f")
-        tune_row(panel, "release ms", self.tune_vars["release_ms"], 0.0, 500.0, 10.0, "%.0f")
-        tune_row(panel, "floor", self.tune_vars["floor"], 0.0, 0.30, 0.01)
-        tune_row(panel, "vol ramp %/min", self.tune_vars["volume_ramp"], 0.0, 2.0, 0.1, "%.1f")
-
-        ttk.Separator(panel, orient="horizontal").pack(fill="x", pady=8, padx=10)
-
-        tk.Label(panel, text="Video", fg="#fff", bg="#1e1e1e",
-                 font=("Arial", 11, "bold")).pack(anchor="w", padx=10)
-        tune_row(panel, "max dim (px)", self.video_vars["max_dim"], 480, 3840, 160, "%.0f")
-        tune_row(panel, "fps", self.video_vars["fps"], 15, 60, 1, "%.0f")
-        tune_row(panel, "bloom", self.video_vars["bloom"], 0.0, 1.0, 0.05)
-        tune_row(panel, "min dim (base)", self.video_vars["min_dim"], 0.1, 1.0, 0.05)
+        spin_row(card_video, "max dim (px)", self.video_vars["max_dim"],
+                 "max_dim", 480, 3840, 160, "%.0f")
+        spin_row(card_video, "fps", self.video_vars["fps"], "fps",
+                 15, 60, 1, "%.0f")
+        spin_row(card_video, "bloom", self.video_vars["bloom"], "bloom",
+                 0.0, 1.0, 0.05)
+        spin_row(card_video, "min dim (base)", self.video_vars["min_dim"],
+                 "min_dim", 0.1, 1.0, 0.05)
+        spin_row(card_video, "effect opacity", self.video_vars["effect_opacity"],
+                 "effect_opacity", 0.0, 1.0, 0.05)
 
     def _build_bottom(self):
         bot = tk.Frame(self.root, bg="#1e1e1e")
@@ -673,6 +801,7 @@ class StudioApp:
                 base_dim_range=(video["min_dim"], 1.0),
                 scene_duration_s=scene_duration_s,
                 crossfade_s=crossfade_s,
+                effect_opacity=video["effect_opacity"],
                 progress=render_progress,
             )
 
